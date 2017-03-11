@@ -568,7 +568,7 @@ struct chain_topology *new_topology(const tal_t *ctx, struct log *log)
 	txwatch_hash_init(&topo->txwatches);
 	txowatch_hash_init(&topo->txowatches);
 	topo->log = log;
-	topo->default_fee_rate = 40000;
+	topo->default_fee_rate = 100000;
 	topo->override_fee_rate = 0;
 	topo->dev_no_broadcast = false;
 
