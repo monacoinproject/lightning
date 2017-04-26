@@ -21,7 +21,10 @@ class UnixDomainSocketRpc(object):
         buff = b''
         while True:
             try:
-                buff += sock.recv(1024)
+                b = sock.recv(1024)
+                buff += b
+                if len(b) == 0:
+                    return {'error': 'Connection to RPC server lost.'}
                 # Convert late to UTF-8 so glyphs split across recvs do not
                 # impact us
                 objs, _ = self.decoder.raw_decode(buff.decode("UTF-8"))
@@ -29,6 +32,17 @@ class UnixDomainSocketRpc(object):
             except ValueError:
                 # Probably didn't read enough 
                 pass
+
+    def __getattr__(self, name):
+        """Intercept any call that is not explicitly defined and call _call
+
+        We might still want to define the actual methods in the subclasses for
+        documentation purposes.
+        """
+        name = name.replace('_', '-')
+        def wrapper(*args, **kwargs):
+            return self._call(name, args)
+        return wrapper
 
     def _call(self, method, args):
         logging.debug("Calling %s with arguments %r", method, args)
@@ -63,11 +77,6 @@ class LightningRpc(UnixDomainSocketRpc):
     This implementation is thread safe in that it locks the socket
     between calls, but it does not (yet) support concurrent calls.
     """
-    def connect(self, hostname, port, remote_id):
-        return self._call("connect", [hostname, port, remote_id])
-
-    def getpeers(self):
-        return self._call("getpeers", [])
 
     def getpeer(self, peer_id):
         """Get info about a specific peer.
@@ -78,28 +87,20 @@ class LightningRpc(UnixDomainSocketRpc):
                 return p
         return None
 
-    def stop(self):
-        return self._call("stop", [])
-
     def getlog(self, level=None):
         args = []
         if level is not None:
             args.append(level)
         return self._call("getlog", args)
 
-    def getinfo(self):
-        return self._call("getinfo", [])
-
     def dev_add_route(self, src, dst, base, var, delay, minblocks):
-        """Add route from {src} to {dst}, {base} rate in msatoshi, {var} rate in msatoshi, {delay} blocks delay and {minblocks} minimum timeout
+        """ Add a route from src to dst using the given parameters.
+
+        Add route from {src} to {dst}, {base} rate in msatoshi, {var} rate in
+        msatoshi, {delay} blocks delay and {minblocks} minimum timeout
         """
         return self._call("dev-add-route", [src, dst, base, var, delay, minblocks])
 
-    def getchannels(self):
-        return self._call("getchannels", [])
-
-    def getnodes(self):
-        return self._call("getnodes", [])
 
 class LegacyLightningRpc(UnixDomainSocketRpc):
     def getchannels(self):

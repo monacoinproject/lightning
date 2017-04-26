@@ -7,7 +7,7 @@
 #include <ccan/err/err.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/structeq/structeq.h>
-#include "status.h"
+#include <lightningd/status.h>
 
 /* Since we use pipes, we need different fds for read and write. */
 static int read_fd, write_fd;
@@ -25,7 +25,7 @@ static ssize_t fake_write_all(int fd, const void *buf, size_t count)
 static const char *status_prefix;
 
 /* Simply print out status updates. */
-#define status_send(msg)			\
+#define status_send_sync(msg)			\
 	printf("%s:# Act %s\n", status_prefix,	\
 	       fromwire_peektype(msg) == WIRE_INITR_ACT_ONE ? "One"	\
 	       : fromwire_peektype(msg) == WIRE_INITR_ACT_TWO ? "Two"	\

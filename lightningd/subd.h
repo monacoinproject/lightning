@@ -9,11 +9,6 @@
 
 struct io_conn;
 
-enum subd_msg_ret {
-	SUBD_NEED_FD,
-	SUBD_COMPLETE
-};
-
 /* By convention, replies are requests + 100 */
 #define SUBD_REPLY_OFFSET 100
 
@@ -35,20 +30,19 @@ struct subd {
 	struct log *log;
 
 	/* Callback when non-reply message comes in. */
-	enum subd_msg_ret (*msgcb)(struct subd *, const u8 *, int);
+	int (*msgcb)(struct subd *, const u8 *, const int *);
 	const char *(*msgname)(int msgtype);
 	void (*finished)(struct subd *sd, int status);
 
 	/* Buffer for input. */
 	u8 *msg_in;
-	/* While we're reading an fd in. */
-	int fd_in;
+
+	/* While we're reading fds in. */
+	size_t num_fds_in_read;
+	int *fds_in;
 
 	/* Messages queue up here. */
 	struct msg_queue outq;
-
-	/* FD to close (used when we just sent it). */
-	int fd_to_close;
 
 	/* Callbacks for replies. */
 	struct list_head reqs;
@@ -65,9 +59,9 @@ struct subd {
  * @finished: function to call when it's finished (with exit status).
  * @...: the fds to hand as fd 3, 4... terminated with -1.
  *
- * @msgcb is called with fd == -1 when a message is received; if it
- * returns SUBD_NEED_FD, we read an fd from the daemon and call it
- * again with that as the third arg.
+ * @msgcb gets called with @fds set to NULL: if it returns a positive number,
+ * that many @fds are received before calling again.  If it returns -1, the
+ * subdaemon is shutdown.
  *
  * If this succeeds subd owns @peer.
  */
@@ -76,8 +70,7 @@ struct subd *new_subd(const tal_t *ctx,
 		      const char *name,
 		      struct peer *peer,
 		      const char *(*msgname)(int msgtype),
-		      enum subd_msg_ret (*msgcb)
-		      (struct subd *, const u8 *, int fd),
+		      int (*msgcb)(struct subd *, const u8 *, const int *fds),
 		      void (*finished)(struct subd *, int), ...);
 
 /**
@@ -96,27 +89,39 @@ void subd_send_fd(struct subd *sd, int fd);
 
 /**
  * subd_req - queue a request to the subdaemon.
+ * @ctx: lifetime for the callback: if this is freed, don't call replycb.
  * @sd: subdaemon to request
  * @msg_out: request message (can be take)
  * @fd_out: if >=0 fd to pass at the end of the message (closed after)
- * @fd_in: if not NULL, where to put fd read in at end of reply.
+ * @num_fds_in: how many fds to read in to hand to @replycb.
  * @replycb: callback when reply comes in, returns false to shutdown daemon.
  * @replycb_data: final arg to hand to @replycb
  *
  * @replycb cannot free @sd, so it returns false to remove it.
  */
-#define subd_req(sd, msg_out, fd_out, fd_in, replycb, replycb_data)	\
-	subd_req_((sd), (msg_out), (fd_out), (fd_in),			\
-		       typesafe_cb_preargs(bool, void *,		\
-					   (replycb), (replycb_data),	\
-					   struct subd *,		\
-					   const u8 *),			\
+#define subd_req(ctx, sd, msg_out, fd_out, num_fds_in, replycb, replycb_data) \
+	subd_req_((ctx), (sd), (msg_out), (fd_out), (num_fds_in),	\
+		  typesafe_cb_preargs(bool, void *,			\
+				      (replycb), (replycb_data),	\
+				      struct subd *,			\
+				      const u8 *, const int *),		\
 		       (replycb_data))
-void subd_req_(struct subd *sd,
-		    const u8 *msg_out,
-		    int fd_out, int *fd_in,
-		    bool (*replycb)(struct subd *, const u8 *, void *),
-		    void *replycb_data);
+void subd_req_(const tal_t *ctx,
+	       struct subd *sd,
+	       const u8 *msg_out,
+	       int fd_out, size_t num_fds_in,
+	       bool (*replycb)(struct subd *, const u8 *, const int *, void *),
+	       void *replycb_data);
+
+/**
+ * subd_shutdown - try to politely shut down a subdaemon.
+ * @subd: subd to shutdown.
+ * @seconds: maximum seconds to wait for it to exit.
+ *
+ * This closes the fd to the subdaemon, and gives it a little while to exit.
+ * The @finished callback will never be called.
+ */
+void subd_shutdown(struct subd *subd, unsigned int seconds);
 
 char *opt_subd_debug(const char *optarg, struct lightningd *ld);
 

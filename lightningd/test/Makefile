@@ -8,7 +8,7 @@ LIGHTNINGD_TEST_PROGRAMS := $(LIGHTNINGD_TEST_OBJS:.o=)
 
 update-mocks: $(LIGHTNINGD_TEST_SRC:%=update-mocks/%)
 
-$(LIGHTNINGD_TEST_PROGRAMS): $(CCAN_OBJS) $(CORE_OBJS) $(CORE_TX_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(LIBBASE58_OBJS) $(LIGHTNINGD_OLD_LIB_OBJS) utils.o libsecp256k1.a libsodium.a libwallycore.a
+$(LIGHTNINGD_TEST_PROGRAMS): $(CCAN_OBJS) $(CCAN_SHACHAIN48_OBJ) $(CORE_OBJS) $(CORE_TX_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(LIBBASE58_OBJS) $(LIGHTNINGD_OLD_LIB_OBJS) utils.o libsecp256k1.a libsodium.a libwallycore.a
 
 $(LIGHTNINGD_TEST_OBJS): $(LIGHTNINGD_HEADERS) $(LIGHTNINGD_SRC) $(LIGHTNINGD_LIB_SRC)
 
@@ -18,7 +18,7 @@ lightningd/tests: $(LIGHTNINGD_TEST_PROGRAMS:%=unittest/%)
 lightningd-test-0-basic: lightningd-test-setup-0
 
 lightningd-test-0-%:
-	NO_VALGRIND=$(NO_VALGRIND) VARIANT=0 lightningd/test/test-$*
+	NO_VALGRIND=$(NO_VALGRIND) VG_TRACE_CHILDREN="--trace-children=yes" VARIANT=0 lightningd/test/test-$*
 
 # We shutdown first in case something is left over.
 lightningd-test-setup-%: lightningd-all daemon/lightning-cli

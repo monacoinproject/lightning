@@ -258,7 +258,7 @@ struct node_connection *add_connection(struct routing_state *rstate,
 	c->active = true;
 	c->last_timestamp = 0;
 	memset(&c->short_channel_id, 0, sizeof(c->short_channel_id));
-	c->flags = pubkey_cmp(from, to) > 0;
+	c->flags = get_channel_direction(from, to);
 	return c;
 }
 
@@ -356,18 +356,14 @@ static void bfg_one_edge(struct node *node, size_t edgenum, double riskfactor)
 	}
 }
 
-struct pubkey *find_route(const tal_t *ctx,
-			struct routing_state *rstate,
-			const struct pubkey *from,
-			const struct pubkey *to,
-			u64 msatoshi,
-			double riskfactor,
-			s64 *fee,
-			struct node_connection ***route)
+struct node_connection *
+find_route(const tal_t *ctx, struct routing_state *rstate,
+	   const struct pubkey *from, const struct pubkey *to, u64 msatoshi,
+	   double riskfactor, s64 *fee, struct node_connection ***route)
 {
 	struct node *n, *src, *dst;
 	struct node_map_iter it;
-	struct pubkey *first;
+	struct node_connection *first_conn;
 	int runs, i, best;
 
 	/* Note: we map backwards, since we know the amount of satoshi we want
@@ -434,10 +430,9 @@ struct pubkey *find_route(const tal_t *ctx,
 	/* Save route from *next* hop (we return first hop as peer).
 	 * Note that we take our own fees into account for routing, even
 	 * though we don't pay them: it presumably effects preference. */
+	first_conn = dst->bfg[best].prev;
 	dst = dst->bfg[best].prev->dst;
 	best--;
-
-	first = &dst->id;
 
 	*fee = dst->bfg[best].total - msatoshi;
 	*route = tal_arr(ctx, struct node_connection *, best);
@@ -450,7 +445,7 @@ struct pubkey *find_route(const tal_t *ctx,
 
 	msatoshi += *fee;
 	log_info(rstate->base_log, "find_route:");
-	log_add_struct(rstate->base_log, "via %s", struct pubkey, first);
+	log_add_struct(rstate->base_log, "via %s", struct pubkey, &first_conn->dst->id);
 	/* If there are intermidiaries, dump them, and total fees. */
 	if (best != 0) {
 		for (i = 0; i < best; i++) {
@@ -465,7 +460,7 @@ struct pubkey *find_route(const tal_t *ctx,
 		log_add(rstate->base_log, "=%"PRIi64"(%+"PRIi64")",
 			(*route)[best-1]->dst->bfg[best-1].total, *fee);
 	}
-	return first;
+	return first_conn;
 }
 
 static bool get_slash_u32(const char **arg, u32 *v)
@@ -513,11 +508,11 @@ char *opt_add_route(const char *arg, struct lightningd_state *dstate)
 bool add_channel_direction(struct routing_state *rstate,
 			   const struct pubkey *from,
 			   const struct pubkey *to,
-			   const int direction,
 			   const struct short_channel_id *short_channel_id,
 			   const u8 *announcement)
 {
 	struct node_connection *c = get_connection(rstate, from, to);
+	u16 direction = get_channel_direction(from, to);
 	if (c){
 		/* Do not clobber connections added otherwise */
 		memcpy(&c->short_channel_id, short_channel_id,
@@ -640,6 +635,39 @@ u8 *write_ip(const tal_t *ctx, const char *srcip, int port)
 	}
 }
 
+/* Verify the signature of a channel_update message */
+static bool check_channel_update(const struct pubkey *node_key,
+				 const secp256k1_ecdsa_signature *node_sig,
+				 const u8 *update)
+{
+	/* 2 byte msg type + 64 byte signatures */
+	int offset = 66;
+	struct sha256_double hash;
+	sha256_double(&hash, update + offset, tal_len(update) - offset);
+
+	return check_signed_hash(&hash, node_sig, node_key);
+}
+
+static bool check_channel_announcement(
+    const struct pubkey *node1_key, const struct pubkey *node2_key,
+    const struct pubkey *bitcoin1_key, const struct pubkey *bitcoin2_key,
+    const secp256k1_ecdsa_signature *node1_sig,
+    const secp256k1_ecdsa_signature *node2_sig,
+    const secp256k1_ecdsa_signature *bitcoin1_sig,
+    const secp256k1_ecdsa_signature *bitcoin2_sig, const u8 *announcement)
+{
+	/* 2 byte msg type + 256 byte signatures */
+	int offset = 258;
+	struct sha256_double hash;
+	sha256_double(&hash, announcement + offset,
+		      tal_len(announcement) - offset);
+
+	return check_signed_hash(&hash, node1_sig, node1_key) &&
+	       check_signed_hash(&hash, node2_sig, node2_key) &&
+	       check_signed_hash(&hash, bitcoin1_sig, bitcoin1_key) &&
+	       check_signed_hash(&hash, bitcoin2_sig, bitcoin2_key);
+}
+
 void handle_channel_announcement(
 	struct routing_state *rstate,
 	const u8 *announce, size_t len)
@@ -672,7 +700,6 @@ void handle_channel_announcement(
 	}
 
 	// FIXME: Check features!
-	//FIXME(cdecker) Check signatures, when the spec is settled
 	//FIXME(cdecker) Check chain topology for the anchor TX
 
 	log_debug(rstate->base_log,
@@ -682,13 +709,22 @@ void handle_channel_announcement(
 		  short_channel_id.outnum
 		);
 
-	forward |= add_channel_direction(rstate, &node_id_1,
-					 &node_id_2, 0, &short_channel_id,
-					 serialized);
-	forward |= add_channel_direction(rstate, &node_id_2,
-					 &node_id_1, 1, &short_channel_id,
-					 serialized);
-	if (!forward){
+	if (!check_channel_announcement(&node_id_1, &node_id_2, &bitcoin_key_1,
+					&bitcoin_key_2, &node_signature_1,
+					&node_signature_2, &bitcoin_signature_1,
+					&bitcoin_signature_2, serialized)) {
+		log_debug(
+		    rstate->base_log,
+		    "Signature verification of channel announcement failed");
+		tal_free(tmpctx);
+		return;
+	}
+
+	forward |= add_channel_direction(rstate, &node_id_1, &node_id_2,
+					 &short_channel_id, serialized);
+	forward |= add_channel_direction(rstate, &node_id_2, &node_id_1,
+					 &short_channel_id, serialized);
+	if (!forward) {
 		log_debug(rstate->base_log, "Not forwarding channel_announcement");
 		tal_free(tmpctx);
 		return;
@@ -747,6 +783,10 @@ void handle_channel_update(struct routing_state *rstate, const u8 *update, size_
 		log_debug(rstate->base_log, "Ignoring outdated update.");
 		tal_free(tmpctx);
 		return;
+	} else if (!check_channel_update(&c->src->id, &signature, serialized)) {
+		log_debug(rstate->base_log, "Signature verification failed.");
+		tal_free(tmpctx);
+		return;
 	}
 
 	//FIXME(cdecker) Check signatures
@@ -755,7 +795,7 @@ void handle_channel_update(struct routing_state *rstate, const u8 *update, size_
 	c->htlc_minimum_msat = htlc_minimum_msat;
 	c->base_fee = fee_base_msat;
 	c->proportional_fee = fee_proportional_millionths;
-	c->active = true;
+	c->active = (flags & ROUTING_FLAGS_DISABLED) == 0;
 	log_debug(rstate->base_log, "Channel %d:%d:%d(%d) was updated.",
 		  short_channel_id.blocknum,
 		  short_channel_id.txnum,
@@ -765,6 +805,7 @@ void handle_channel_update(struct routing_state *rstate, const u8 *update, size_
 
 	u8 *tag = tal_arr(tmpctx, u8, 0);
 	towire_short_channel_id(&tag, &short_channel_id);
+	towire_u16(&tag, flags & 0x1);
 	queue_broadcast(rstate->broadcasts,
 			WIRE_CHANNEL_UPDATE,
 			tag,
@@ -842,4 +883,49 @@ void handle_node_announcement(
 	tal_free(node->node_announcement);
 	node->node_announcement = tal_steal(node, serialized);
 	tal_free(tmpctx);
+}
+
+struct route_hop *get_route(tal_t *ctx, struct routing_state *rstate,
+			    const struct pubkey *source,
+			    const struct pubkey *destination,
+			    const u32 msatoshi, double riskfactor)
+{
+	struct node_connection **route;
+	u64 total_amount;
+	unsigned int total_delay;
+	s64 fee;
+	struct route_hop *hops;
+	int i;
+	struct node_connection *first_conn;
+
+	first_conn = find_route(ctx, rstate, source, destination, msatoshi,
+				riskfactor, &fee, &route);
+
+	if (!first_conn) {
+		return NULL;
+	}
+
+	/* Fees, delays need to be calculated backwards along route. */
+	hops = tal_arr(ctx, struct route_hop, tal_count(route) + 1);
+	total_amount = msatoshi;
+	total_delay = 0;
+
+	for (i = tal_count(route) - 1; i >= 0; i--) {
+		hops[i + 1].nodeid = route[i]->dst->id;
+		hops[i + 1].amount = total_amount;
+		total_amount += connection_fee(route[i], total_amount);
+
+		total_delay += route[i]->delay;
+		if (total_delay < route[i]->min_blocks)
+			total_delay = route[i]->min_blocks;
+		hops[i + 1].delay = total_delay;
+	}
+	/* Backfill the first hop manually */
+	hops[0].nodeid = first_conn->dst->id;
+	/* We don't charge ourselves any fees. */
+	hops[0].amount = total_amount;
+	/* We do require delay though. */
+	total_delay += first_conn->delay;
+	hops[0].delay = total_delay;
+	return hops;
 }

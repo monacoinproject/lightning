@@ -3,6 +3,8 @@
 #include "type_to_string.h"
 #include <assert.h>
 #include <bitcoin/preimage.h>
+#include <bitcoin/script.h>
+#include <bitcoin/tx.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/mem/mem.h>
 #include <ccan/structeq/structeq.h>
@@ -10,8 +12,9 @@
 #include <daemon/htlc.h>
 #include <inttypes.h>
 #include <lightningd/channel_config.h>
+#include <lightningd/htlc_tx.h>
 #include <lightningd/key_derive.h>
-#include <status.h>
+#include <lightningd/status.h>
 #include <string.h>
 
 static void htlc_arr_append(const struct htlc ***arr, const struct htlc *htlc)
@@ -110,6 +113,8 @@ struct channel *new_channel(const tal_t *ctx,
 			    const struct channel_config *remote,
 			    const struct basepoints *local_basepoints,
 			    const struct basepoints *remote_basepoints,
+			    const struct pubkey *local_funding_pubkey,
+			    const struct pubkey *remote_funding_pubkey,
 			    enum side funder)
 {
 	struct channel *channel = tal(ctx, struct channel);
@@ -126,6 +131,8 @@ struct channel *new_channel(const tal_t *ctx,
 	channel->funder = funder;
 	channel->config[LOCAL] = local;
 	channel->config[REMOTE] = remote;
+	channel->funding_pubkey[LOCAL] = *local_funding_pubkey;
+	channel->funding_pubkey[REMOTE] = *remote_funding_pubkey;
 	htlc_map_init(&channel->htlcs);
 
 	channel->view[LOCAL].feerate_per_kw
@@ -154,14 +161,78 @@ struct channel *new_channel(const tal_t *ctx,
 	return channel;
 }
 
-/* FIXME: We could cache this. */
-struct bitcoin_tx *channel_tx(const tal_t *ctx,
-			      const struct channel *channel,
-			      const struct pubkey *per_commitment_point,
-			      const struct htlc ***htlcmap,
-			      enum side side)
+static void add_htlcs(struct bitcoin_tx ***txs,
+		      const u8 ***wscripts,
+		      const struct htlc **htlcmap,
+		      const struct channel *channel,
+		      const struct pubkey *side_payment_key,
+		      const struct pubkey *other_payment_key,
+		      const struct pubkey *side_revocation_key,
+		      const struct pubkey *side_delayed_payment_key,
+		      enum side side)
 {
-	struct bitcoin_tx *tx;
+	size_t i, n;
+	struct sha256_double txid;
+	u32 feerate_per_kw = channel->view[side].feerate_per_kw;
+
+	/* Get txid of commitment transaction */
+	bitcoin_txid((*txs)[0], &txid);
+
+	for (i = 0; i < tal_count(htlcmap); i++) {
+		const struct htlc *htlc = htlcmap[i];
+		struct bitcoin_tx *tx;
+		u8 *wscript;
+
+		if (!htlc)
+			continue;
+
+		if (htlc_owner(htlc) == side) {
+			tx = htlc_timeout_tx(*txs, &txid, i,
+					     htlc,
+					     to_self_delay(channel, side),
+					     side_revocation_key,
+					     side_delayed_payment_key,
+					     feerate_per_kw);
+			wscript	= bitcoin_wscript_htlc_offer(*wscripts,
+							     side_payment_key,
+							     other_payment_key,
+							     &htlc->rhash,
+							     side_revocation_key);
+		} else {
+			tx = htlc_success_tx(*txs, &txid, i,
+					     htlc,
+					     to_self_delay(channel, side),
+					     side_revocation_key,
+					     side_delayed_payment_key,
+					     feerate_per_kw);
+			wscript	= bitcoin_wscript_htlc_receive(*wscripts,
+							       &htlc->expiry,
+							       side_payment_key,
+							       other_payment_key,
+							       &htlc->rhash,
+							       side_revocation_key);
+		}
+
+		/* Append to array. */
+		n = tal_count(*txs);
+		assert(n == tal_count(*wscripts));
+
+		tal_resize(wscripts, n+1);
+		tal_resize(txs, n+1);
+		(*wscripts)[n] = wscript;
+		(*txs)[n] = tx;
+	}
+}
+
+/* FIXME: We could cache these. */
+struct bitcoin_tx **channel_txs(const tal_t *ctx,
+				const struct htlc ***htlcmap,
+				const u8 ***wscripts,
+				const struct channel *channel,
+				const struct pubkey *per_commitment_point,
+				enum side side)
+{
+	struct bitcoin_tx **txs;
 	const struct htlc **committed;
 	/* Payment keys for @side and !@side */
 	struct pubkey side_payment_key, other_payment_key;
@@ -185,7 +256,7 @@ struct bitcoin_tx *channel_tx(const tal_t *ctx,
 			       &side_delayed_payment_key))
 		return NULL;
 
-	if (!derive_revocation_key(&channel->basepoints[side].revocation,
+	if (!derive_revocation_key(&channel->basepoints[!side].revocation,
 				   per_commitment_point,
 				   &side_revocation_key))
 		return NULL;
@@ -193,7 +264,12 @@ struct bitcoin_tx *channel_tx(const tal_t *ctx,
 	/* Figure out what @side will already be committed to. */
 	gather_htlcs(ctx, channel, side, &committed, NULL, NULL);
 
-	tx = commit_tx(ctx, &channel->funding_txid,
+	/* NULL map only allowed at beginning, when we know no HTLCs */
+	if (!htlcmap)
+		assert(tal_count(committed) == 0);
+
+	txs = tal_arr(ctx, struct bitcoin_tx *, 1);
+	txs[0] = commit_tx(ctx, &channel->funding_txid,
 		       channel->funding_txout,
 		       channel->funding_msat / 1000,
 		       channel->funder,
@@ -212,8 +288,19 @@ struct bitcoin_tx *channel_tx(const tal_t *ctx,
 		       ^ channel->commitment_number_obscurer,
 		       side);
 
+	*wscripts = tal_arr(ctx, const u8 *, 1);
+	(*wscripts)[0] = bitcoin_redeem_2of2(*wscripts,
+					     &channel->funding_pubkey[side],
+					     &channel->funding_pubkey[!side]);
+
+	if (htlcmap)
+		add_htlcs(&txs, wscripts, *htlcmap, channel,
+			  &side_payment_key, &other_payment_key,
+			  &side_revocation_key, &side_delayed_payment_key,
+			  side);
+
 	tal_free(committed);
-	return tx;
+	return txs;
 }
 
 struct channel *copy_channel(const tal_t *ctx, const struct channel *old)
@@ -227,7 +314,7 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 				      enum side sender,
 				      u64 id,
 				      u64 msatoshi,
-				      u32 expiry,
+				      u32 cltv_expiry,
 				      const struct sha256 *payment_hash,
 				      const u8 routing[1254])
 {
@@ -248,7 +335,12 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 		htlc->state = RCVD_ADD_HTLC;
 	htlc->id = id;
 	htlc->msatoshi = msatoshi;
-	if (!blocks_to_abs_locktime(expiry, &htlc->expiry))
+	/* BOLT #2:
+	 *
+	 * A receiving node SHOULD fail the channel if a sending node... sets
+	 * `cltv-expiry` to greater or equal to 500000000.
+	 */
+	if (!blocks_to_abs_locktime(cltv_expiry, &htlc->expiry))
 		return CHANNEL_ERR_INVALID_EXPIRY;
 	htlc->rhash = *payment_hash;
 	htlc->r = NULL;
@@ -322,7 +414,7 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 	 *
 	 * A receiving node SHOULD fail the channel if a sending node ... or
 	 * adds more than its `max-htlc-value-in-flight-msat` worth of offered
-	 * HTLCs to its local commitment transaction. */
+	 * HTLCs to its local commitment transaction */
 	if (msat_in_htlcs > max_htlc_value_in_flight_msat(channel, recipient)) {
 		e = CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
 		goto out;
@@ -363,7 +455,6 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 	assert(balance_msat >= 0);
 	for (i = 0; i < tal_count(adding); i++)
 		balance_msat += balance_adding_htlc(adding[i], sender);
-	assert(balance_msat >= 0);
 
 	/* This is a little subtle:
 	 *
@@ -390,15 +481,14 @@ struct htlc *channel_get_htlc(struct channel *channel, enum side sender, u64 id)
 }
 
 enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
-					      enum side sender,
+					      enum side owner,
 					      u64 id,
 					      const struct preimage *preimage)
 {
 	struct sha256 hash;
 	struct htlc *htlc;
 
-	/* Fulfill is done by !creator of HTLC */
-	htlc = channel_get_htlc(channel, !sender, id);
+	htlc = channel_get_htlc(channel, owner, id);
 	if (!htlc)
 		return CHANNEL_ERR_NO_SUCH_ID;
 
@@ -449,6 +539,42 @@ enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
 	return CHANNEL_ERR_REMOVE_OK;
 }
 
+enum channel_remove_err channel_fail_htlc(struct channel *channel,
+					  enum side owner, u64 id)
+{
+	struct htlc *htlc;
+
+	htlc = channel_get_htlc(channel, owner, id);
+	if (!htlc)
+		return CHANNEL_ERR_NO_SUCH_ID;
+
+	/* BOLT #2:
+	 *
+	 * A receiving node MUST check that `id` corresponds to an HTLC in its
+	 * current commitment transaction, and MUST fail the channel if it
+	 * does not.
+	 */
+	if (!htlc_has(htlc, HTLC_FLAG(!htlc_owner(htlc), HTLC_F_COMMITTED))) {
+		status_trace("channel_fail_htlc: %"PRIu64" in state %s",
+			     htlc->id, htlc_state_name(htlc->state));
+		return CHANNEL_ERR_HTLC_UNCOMMITTED;
+	}
+
+	/* FIXME: Technically, they can fail this before we're committed to
+	 * it.  This implies a non-linear state machine. */
+	if (htlc->state == SENT_ADD_ACK_REVOCATION)
+		htlc->state = RCVD_REMOVE_HTLC;
+	else if (htlc->state == RCVD_ADD_ACK_REVOCATION)
+		htlc->state = SENT_REMOVE_HTLC;
+	else {
+		status_trace("channel_fail_htlc: %"PRIu64" in state %s",
+			     htlc->id, htlc_state_name(htlc->state));
+		return CHANNEL_ERR_HTLC_NOT_IRREVOCABLE;
+	}
+
+	return CHANNEL_ERR_REMOVE_OK;
+}
+
 static void htlc_incstate(struct channel *channel,
 			  struct htlc *htlc,
 			  enum side sidechanged)
@@ -490,15 +616,35 @@ static void htlc_incstate(struct channel *channel,
 	}
 }
 
+static void check_lockedin(const struct htlc *h,
+			   void (*oursfail)(const struct htlc *, void *),
+			   void (*theirslocked)(const struct htlc *, void *),
+			   void (*theirsfulfilled)(const struct htlc *, void *),
+			   void *cbarg)
+{
+	/* If it was fulfilled, we handled it immediately. */
+	if (h->state == RCVD_REMOVE_ACK_REVOCATION && !h->r)
+		oursfail(h, cbarg);
+	else if (h->state == RCVD_ADD_ACK_REVOCATION)
+		theirslocked(h, cbarg);
+	else if (h->state == RCVD_REMOVE_ACK_COMMIT && h->r)
+		theirsfulfilled(h, cbarg);
+}
+
 /* FIXME: Commit to storage when this happens. */
-static bool change_htlcs(struct channel *channel,
+/* Returns flags which were changed. */
+static int change_htlcs(struct channel *channel,
 			 enum side sidechanged,
 			 const enum htlc_state *htlc_states,
-			 size_t n_hstates)
+			 size_t n_hstates,
+			 void (*oursfail)(const struct htlc *, void *),
+			 void (*theirslocked)(const struct htlc *, void *),
+			 void (*theirsfulfilled)(const struct htlc *, void *),
+			 void *cbarg)
 {
 	struct htlc_map_iter it;
 	struct htlc *h;
-	bool changed = false;
+	int cflags = 0;
 	size_t i;
 
 	for (h = htlc_map_first(&channel->htlcs, &it);
@@ -507,55 +653,103 @@ static bool change_htlcs(struct channel *channel,
 		for (i = 0; i < n_hstates; i++) {
 			if (h->state == htlc_states[i]) {
 				htlc_incstate(channel, h, sidechanged);
-				changed = true;
+				check_lockedin(h,
+					       oursfail,
+					       theirslocked,
+					       theirsfulfilled,
+					       cbarg);
+				cflags |= (htlc_state_flags(htlc_states[i])
+					   ^ htlc_state_flags(h->state));
 			}
 		}
 	}
-	return changed;
+	return cflags;
 }
 
 /* FIXME: Handle fee changes too. */
-bool channel_sent_commit(struct channel *channel)
+bool channel_sending_commit(struct channel *channel)
 {
+	int change;
 	const enum htlc_state states[] = { SENT_ADD_HTLC,
 					   SENT_REMOVE_REVOCATION,
 					   SENT_ADD_REVOCATION,
 					   SENT_REMOVE_HTLC };
-	status_trace("sent commit");
-	return change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states));
+	status_trace("Trying commit");
+	change = change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states),
+			      NULL, NULL, NULL, NULL);
+	return change & HTLC_REMOTE_F_COMMITTED;
 }
 
-bool channel_rcvd_revoke_and_ack(struct channel *channel)
+bool channel_rcvd_revoke_and_ack_(struct channel *channel,
+				  void (*oursfail)(const struct htlc *htlc,
+						   void *cbarg),
+				  void (*theirslocked)(const struct htlc *htlc,
+						       void *cbarg),
+				  void *cbarg)
 {
+	int change;
 	const enum htlc_state states[] = { SENT_ADD_COMMIT,
 					   SENT_REMOVE_ACK_COMMIT,
 					   SENT_ADD_ACK_COMMIT,
 					   SENT_REMOVE_COMMIT };
 
-	status_trace("received revoke_and_ack");
-	return change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states));
+	status_trace("Received revoke_and_ack");
+	change = change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states),
+			      oursfail, theirslocked, NULL, cbarg);
+	return change & HTLC_LOCAL_F_COMMITTED;
 }
 
 /* FIXME: We can actually merge these two... */
-bool channel_rcvd_commit(struct channel *channel)
+bool channel_rcvd_commit_(struct channel *channel,
+			  void (*theirsfulfilled)(const struct htlc *htlc,
+						  void *cbarg),
+			  void *cbarg)
 {
+	int change;
 	const enum htlc_state states[] = { RCVD_ADD_REVOCATION,
 					   RCVD_REMOVE_HTLC,
 					   RCVD_ADD_HTLC,
 					   RCVD_REMOVE_REVOCATION };
 
-	status_trace("received commit");
-	return change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states));
+	status_trace("Received commit");
+	change = change_htlcs(channel, LOCAL, states, ARRAY_SIZE(states),
+			      NULL, NULL, theirsfulfilled, cbarg);
+	return change & HTLC_LOCAL_F_COMMITTED;
 }
 
-bool channel_sent_revoke_and_ack(struct channel *channel)
+bool channel_sending_revoke_and_ack(struct channel *channel)
 {
+	int change;
 	const enum htlc_state states[] = { RCVD_ADD_ACK_COMMIT,
 					   RCVD_REMOVE_COMMIT,
 					   RCVD_ADD_COMMIT,
 					   RCVD_REMOVE_ACK_COMMIT };
-	status_trace("sent revoke_and_ack");
-	return change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states));
+	status_trace("Sending revoke_and_ack");
+	change = change_htlcs(channel, REMOTE, states, ARRAY_SIZE(states),
+			      NULL, NULL, NULL, NULL);
+	return change & HTLC_REMOTE_F_PENDING;
+}
+
+/* FIXME: Trivial to optimize: set flag on channel_sending_commit,
+ * clear in channel_rcvd_revoke_and_ack. */
+bool channel_awaiting_revoke_and_ack(const struct channel *channel)
+{
+	const enum htlc_state states[] = { SENT_ADD_COMMIT,
+					   SENT_REMOVE_ACK_COMMIT,
+					   SENT_ADD_ACK_COMMIT,
+					   SENT_REMOVE_COMMIT };
+	struct htlc_map_iter it;
+	struct htlc *h;
+	size_t i;
+
+	for (h = htlc_map_first(&channel->htlcs, &it);
+	     h;
+	     h = htlc_map_next(&channel->htlcs, &it)) {
+		for (i = 0; i < ARRAY_SIZE(states); i++)
+			if (h->state == states[i])
+				return true;
+	}
+	return false;
 }
 
 static char *fmt_channel_view(const tal_t *ctx, const struct channel_view *view)

@@ -5,6 +5,7 @@
 #include <bitcoin/shadouble.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
+#include <ccan/typesafe_cb/typesafe_cb.h>
 #include <daemon/htlc.h>
 #include <lightningd/channel_config.h>
 #include <lightningd/derive_basepoints.h>
@@ -28,6 +29,9 @@ struct channel {
 	/* Funding txid and output. */
 	struct sha256_double funding_txid;
 	unsigned int funding_txout;
+
+	/* Keys used to spend funding tx. */
+	struct pubkey funding_pubkey[NUM_SIDES];
 
 	/* Millisatoshis in from commitment tx */
 	u64 funding_msat;
@@ -126,6 +130,8 @@ static inline u16 to_self_delay(const struct channel *channel, enum side side)
  * @remote: remote channel configuration
  * @local_basepoints: local basepoints.
  * @remote_basepoints: remote basepoints.
+ * @local_fundingkey: local funding key
+ * @remote_fundingkey: remote funding key
  * @funder: which side initiated it.
  *
  * Returns state, or NULL if malformed.
@@ -140,24 +146,30 @@ struct channel *new_channel(const tal_t *ctx,
 			    const struct channel_config *remote,
 			    const struct basepoints *local_basepoints,
 			    const struct basepoints *remote_basepoints,
+			    const struct pubkey *local_funding_pubkey,
+			    const struct pubkey *remote_funding_pubkey,
 			    enum side funder);
+
 /**
- * channel_tx: Get the current commitment transaction for the channel.
+ * channel_txs: Get the current commitment and htlc txs for the channel.
  * @ctx: tal context to allocate return value from.
  * @channel: The channel to evaluate
- * @per_commitment_point: Per-commitment point to determine keys
  * @htlc_map: Pointer to htlcs for each tx output (allocated off @ctx) or NULL.
+ * @wscripts: Pointer to array of wscript for each tx returned (alloced off @ctx)
+ * @per_commitment_point: Per-commitment point to determine keys
  * @side: which side to get the commitment transaction for
  *
  * Returns the unsigned commitment transaction for the committed state
- * for @side and fills in @htlc_map (if not NULL), or NULL on key
- * derivation failure.
+ * for @side, followed by the htlc transactions in output order, and
+ * fills in @htlc_map (if not NULL), or NULL on key derivation
+ * failure.
  */
-struct bitcoin_tx *channel_tx(const tal_t *ctx,
-			      const struct channel *channel,
-			      const struct pubkey *per_commitment_point,
-			      const struct htlc ***htlcmap,
-			      enum side side);
+struct bitcoin_tx **channel_txs(const tal_t *ctx,
+				const struct htlc ***htlcmap,
+				const u8 ***wscripts,
+				const struct channel *channel,
+				const struct pubkey *per_commitment_point,
+				enum side side);
 
 /**
  * actual_feerate: what is the actual feerate for the local side.
@@ -207,7 +219,7 @@ enum channel_add_err {
  * @offerer: the side offering the HTLC (to the other side).
  * @id: unique HTLC id.
  * @msatoshi: amount in millisatoshi.
- * @expiry: block number when HTLC can no longer be redeemed.
+ * @cltv_expiry: block number when HTLC can no longer be redeemed.
  * @payment_hash: hash whose preimage can redeem HTLC.
  * @routing: routing information (copied)
  *
@@ -219,7 +231,7 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 				      enum side sender,
 				      u64 id,
 				      u64 msatoshi,
-				      u32 expiry,
+				      u32 cltv_expiry,
 				      const struct sha256 *payment_hash,
 				      const u8 routing[1254]);
 
@@ -249,19 +261,19 @@ enum channel_remove_err {
 /**
  * channel_fail_htlc: remove an HTLC, funds to the side which offered it.
  * @channel: The channel state
- * @sender: the side fulfilling the HTLC (opposite to side which sent it)
+ * @owner: the side who offered the HTLC (opposite to that failing it)
  * @id: unique HTLC id.
  *
  * This will remove the htlc and credit the value of the HTLC (back)
  * to its offerer.
  */
 enum channel_remove_err channel_fail_htlc(struct channel *channel,
-					  enum side sender, u64 id);
+					  enum side owner, u64 id);
 
 /**
  * channel_fulfill_htlc: remove an HTLC, funds to side which accepted it.
  * @channel: The channel state
- * @sender: the side fulfilling the HTLC (opposite to side which sent it)
+ * @owner: the side who offered the HTLC (opposite to that fulfilling it)
  * @id: unique HTLC id.
  *
  * If the htlc exists, is not already fulfilled, the preimage is correct and
@@ -270,7 +282,7 @@ enum channel_remove_err channel_fail_htlc(struct channel *channel,
  * and return CHANNEL_ERR_FULFILL_OK.  Otherwise, it will return another error.
  */
 enum channel_remove_err channel_fulfill_htlc(struct channel *channel,
-					     enum side sender,
+					     enum side owner,
 					     u64 id,
 					     const struct preimage *preimage);
 
@@ -309,35 +321,79 @@ void adjust_fee(struct channel *channel, u64 feerate_per_kw, enum side side);
 bool force_fee(struct channel *channel, u64 fee);
 
 /**
- * channel_sent_commit: commit all remote outstanding changes.
+ * channel_sending_commit: commit all remote outstanding changes.
  * @channel: the channel
  *
  * This is where we commit to pending changes we've added; returns true if
- * anything changed. */
-bool channel_sent_commit(struct channel *channel);
+ * anything changed for the remote side (if not, don't send!) */
+bool channel_sending_commit(struct channel *channel);
 
 /**
  * channel_rcvd_revoke_and_ack: accept ack on remote committed changes.
  * @channel: the channel
+ * @oursfail: callback for any unfilfilled htlcs which are now fully removed.
+ * @theirslocked: callback for any new htlcs which are now fully committed.
+ * @cbarg: argument to pass through to @ourhtlcfail  & @theirhtlclocked
  *
  * This is where we commit to pending changes we've added; returns true if
- * anything changed. */
-bool channel_rcvd_revoke_and_ack(struct channel *channel);
+ * anything changed for our local commitment (ie. we have pending changes).
+ */
+#define channel_rcvd_revoke_and_ack(channel, oursfail, theirslocked, cbarg) \
+	channel_rcvd_revoke_and_ack_((channel),				\
+				     typesafe_cb_preargs(void, void *,	\
+							 (oursfail),	\
+							 (cbarg),	\
+							 const struct htlc *), \
+				     typesafe_cb_preargs(void, void *,	\
+							 (theirslocked), \
+							 (cbarg),	\
+							 const struct htlc *), \
+				     (cbarg))
+
+bool channel_rcvd_revoke_and_ack_(struct channel *channel,
+				  void (*oursfail)(const struct htlc *htlc,
+						   void *cbarg),
+				  void (*theirslocked)(const struct htlc *htlc,
+						       void *cbarg),
+				  void *cbarg);
 
 /**
  * channel_rcvd_commit: commit all local outstanding changes.
  * @channel: the channel
+ * @theirsfulfilled: they are irrevocably committed to removal of htlc.
+ * @cbarg: argument to pass through to @theirsfulfilled
  *
  * This is where we commit to pending changes we've added; returns true if
- * anything changed. */
-bool channel_rcvd_commit(struct channel *channel);
+ * anything changed for our local commitment (ie. we had pending changes).
+ * @theirsfulfilled is called for any HTLC we fulfilled which they are
+ * irrevocably committed to, and is in our current commitment.
+ */
+#define channel_rcvd_commit(channel, theirsfulfilled, cbarg)		\
+	channel_rcvd_commit_((channel),					\
+			     typesafe_cb_preargs(void, void *,		\
+						 (theirsfulfilled),	\
+						 (cbarg),		\
+						 const struct htlc *),	\
+			     (cbarg))
+
+bool channel_rcvd_commit_(struct channel *channel,
+			  void (*theirsfulfilled)(const struct htlc *htlc,
+						  void *cbarg),
+			  void *cbarg);
 
 /**
- * channel_sent_revoke_and_ack: sent ack on local committed changes.
+ * channel_sending_revoke_and_ack: sending ack on local committed changes.
  * @channel: the channel
  *
- * This is where we commit to pending changes we've added; returns true if
- * anything changed. */
-bool channel_sent_revoke_and_ack(struct channel *channel);
+ * This is where we commit to pending changes we've added. Returns true if
+ * anything changed for the remote commitment (ie. send a new commit).*/
+bool channel_sending_revoke_and_ack(struct channel *channel);
 
+/**
+ * channel_awaiting_revoke_and_ack: are we waiting for revoke_and_ack?
+ * @channel: the channel
+ *
+ * If true, we can't send a new commit message.
+ */
+bool channel_awaiting_revoke_and_ack(const struct channel *channel);
 #endif /* LIGHTNING_DAEMON_CHANNEL_H */

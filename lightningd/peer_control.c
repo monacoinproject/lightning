@@ -9,8 +9,10 @@
 #include <ccan/tal/str/str.h>
 #include <daemon/chaintopology.h>
 #include <daemon/dns.h>
+#include <daemon/invoice.h>
 #include <daemon/jsonrpc.h>
 #include <daemon/log.h>
+#include <daemon/sphinx.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <lightningd/build_utxos.h>
@@ -22,9 +24,11 @@
 #include <lightningd/hsm/gen_hsm_wire.h>
 #include <lightningd/key_derive.h>
 #include <lightningd/opening/gen_opening_wire.h>
+#include <lightningd/pay.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <wire/gen_onion_wire.h>
 #include <wire/gen_peer_wire.h>
 
 static void destroy_peer(struct peer *peer)
@@ -65,6 +69,8 @@ static struct peer *new_peer(struct lightningd *ld,
 	peer->connect_cmd = cmd;
 	peer->funding_txid = NULL;
 	peer->seed = NULL;
+	peer->locked = false;
+	peer->balance = NULL;
 
 	/* Max 128k per peer. */
 	peer->log_book = new_log_book(peer, 128*1024,
@@ -107,11 +113,13 @@ struct peer *peer_by_id(struct lightningd *ld, const struct pubkey *id)
 	return NULL;
 }
 
-static bool handshake_succeeded(struct subd *hs, const u8 *msg,
+static bool handshake_succeeded(struct subd *hs, const u8 *msg, const int *fds,
 				struct peer *peer)
 {
 	struct crypto_state cs;
 
+	assert(tal_count(fds) == 1);
+	peer->fd = fds[0];
 	if (!peer->id) {
 		struct pubkey id;
 
@@ -152,10 +160,12 @@ err:
 }
 
 static bool peer_got_handshake_hsmfd(struct subd *hsm, const u8 *msg,
+				     const int *fds,
 				     struct peer *peer)
 {
 	const u8 *req;
 
+	assert(tal_count(fds) == 1);
 	if (!fromwire_hsmctl_hsmfd_ecdh_fd_reply(msg, NULL)) {
 		log_unusual(peer->ld->log, "Malformed hsmfd response: %s",
 			    tal_hex(peer, msg));
@@ -168,7 +178,7 @@ static bool peer_got_handshake_hsmfd(struct subd *hsm, const u8 *msg,
 			       "lightningd_handshake", peer,
 			       handshake_wire_type_name,
 			       NULL, NULL,
-			       peer->hsmfd, peer->fd, -1);
+			       fds[0], peer->fd, -1);
 	if (!peer->owner) {
 		log_unusual(peer->ld->log, "Could not subdaemon handshake: %s",
 			    strerror(errno));
@@ -190,11 +200,11 @@ static bool peer_got_handshake_hsmfd(struct subd *hsm, const u8 *msg,
 
 	/* Now hand peer request to the handshake daemon: hands it
 	 * back on success */
-	subd_req(peer->owner, take(req), -1, &peer->fd,
-		 handshake_succeeded, peer);
+	subd_req(peer, peer->owner, take(req), -1, 1, handshake_succeeded, peer);
 	return true;
 
 error:
+	close(fds[0]);
 	tal_free(peer);
 	return true;
 }
@@ -208,9 +218,9 @@ static struct io_plan *peer_in(struct io_conn *conn, struct lightningd *ld)
 		return io_close(conn);
 
 	/* Get HSM fd for this peer. */
-	subd_req(ld->hsm,
+	subd_req(peer, ld->hsm,
 		 take(towire_hsmctl_hsmfd_ecdh(ld, peer->unique_id)),
-		 -1, &peer->hsmfd, peer_got_handshake_hsmfd, peer);
+		 -1, 1, peer_got_handshake_hsmfd, peer);
 
 	/* We don't need conn, we'll pass fd to handshaked. */
 	return io_close_taken_fd(conn);
@@ -339,9 +349,9 @@ static struct io_plan *peer_out(struct io_conn *conn,
 	peer->id = tal_dup(peer, struct pubkey, &jc->id);
 
 	/* Get HSM fd for this peer. */
-	subd_req(ld->hsm,
+	subd_req(peer, ld->hsm,
 		 take(towire_hsmctl_hsmfd_ecdh(ld, peer->unique_id)),
-		 -1, &peer->hsmfd, peer_got_handshake_hsmfd, peer);
+		 -1, 1, peer_got_handshake_hsmfd, peer);
 
 	/* We don't need conn, we'll pass fd to handshaked. */
 	return io_close_taken_fd(conn);
@@ -461,7 +471,12 @@ static void json_getpeers(struct command *cmd,
 			json_add_pubkey(response, "peerid", p->id);
 		if (p->owner)
 			json_add_string(response, "owner", p->owner->name);
-
+		if (p->balance) {
+			json_add_u64(response, "msatoshi_to_us",
+				     p->balance[LOCAL]);
+			json_add_u64(response, "msatoshi_to_them",
+				     p->balance[REMOTE]);
+		}
 		if (leveltok) {
 			info.response = response;
 			json_array_start(response, "log");
@@ -483,9 +498,9 @@ static const struct json_command getpeers_command = {
 };
 AUTODATA(json_command, &getpeers_command);
 
-static struct peer *find_peer_json(struct lightningd *ld,
-				   const char *buffer,
-				   jsmntok_t *peeridtok)
+struct peer *peer_from_json(struct lightningd *ld,
+			    const char *buffer,
+			    jsmntok_t *peeridtok)
 {
 	struct pubkey peerid;
 
@@ -530,11 +545,17 @@ static enum watch_result funding_depth_cb(struct peer *peer,
 					  void *unused)
 {
 	const char *txidstr = type_to_string(peer, struct sha256_double, txid);
+	struct txlocator *loc = locate_tx(peer, peer->ld->topology, txid);
+	struct short_channel_id scid;
+	scid.blocknum = loc->blkheight;
+	scid.txnum = loc->index;
+	scid.outnum = peer->funding_outnum;
+	loc = tal_free(loc);
 
 	log_debug(peer->log, "Funding tx %s depth %u of %u",
-		  txidstr, depth, peer->our_config.minimum_depth);
+		  txidstr, depth, peer->minimum_depth);
 
-	if (depth < peer->our_config.minimum_depth)
+	if (depth < peer->minimum_depth)
 		return KEEP_WATCHING;
 
 	/* In theory, it could have been buried before we got back
@@ -545,12 +566,24 @@ static enum watch_result funding_depth_cb(struct peer *peer,
 		return KEEP_WATCHING;
 	}
 
-	peer_set_condition(peer, "Funding tx reached depth %u", depth);
-	subd_send_msg(peer->owner, take(towire_channel_funding_locked(peer)));
+	/* Make sure we notify `channeld` just once. */
+	if (!peer->locked) {
+		peer_set_condition(peer, "Funding tx reached depth %u", depth);
+		subd_send_msg(peer->owner, take(towire_channel_funding_locked(peer, &scid)));
+		peer->locked = true;
+	}
+
+	/* With the above this is max(funding_depth, 6) before
+	 * announcing the channel */
+	if (depth < ANNOUNCE_MIN_DEPTH) {
+		return KEEP_WATCHING;
+	}
+	subd_send_msg(peer->owner, take(towire_channel_funding_announce_depth(peer)));
 	return DELETE_WATCH;
 }
 
 static bool opening_got_hsm_funding_sig(struct subd *hsm, const u8 *resp,
+					const int *fds,
 					struct funding_channel *fc)
 {
 	secp256k1_ecdsa_signature *sigs;
@@ -593,9 +626,208 @@ static bool opening_got_hsm_funding_sig(struct subd *hsm, const u8 *resp,
 	return true;
 }
 
-static enum subd_msg_ret update_channel_status(struct subd *sd,
-					       const u8 *msg,
-					       int unused)
+struct decoding_htlc {
+	struct peer *peer;
+	u64 id;
+	u32 amount_msat;
+	u32 cltv_expiry;
+	struct sha256 payment_hash;
+	u8 onion[1254];
+	u8 shared_secret[32];
+};
+
+static void fail_htlc(struct peer *peer, u64 htlc_id, const u8 *msg)
+{
+	enum onion_type failcode = fromwire_peektype(msg);
+
+	log_broken(peer->log, "failed htlc %"PRIu64" code 0x%04x (%s)",
+		   htlc_id, failcode, onion_type_name(failcode));
+
+	/* We don't do BADONION here */
+	assert(!(failcode & BADONION));
+	if (failcode & UPDATE) {
+		/* FIXME: Ask gossip daemon for channel_update. */
+	}
+
+	/* FIXME: encrypt msg! */
+	subd_send_msg(peer->owner,
+		      take(towire_channel_fail_htlc(peer, htlc_id, msg)));
+	if (taken(msg))
+		tal_free(msg);
+}
+
+static void handle_localpay(struct htlc_end *hend,
+			    u32 cltv_expiry,
+			    const struct sha256 *payment_hash)
+{
+	u8 *msg;
+	struct invoice *invoice = find_unpaid(hend->peer->ld->dstate.invoices,
+					      payment_hash);
+
+	if (!invoice) {
+		fail_htlc(hend->peer, hend->htlc_id,
+			  take(towire_unknown_payment_hash(hend)));
+		tal_free(hend);
+		return;
+	}
+
+	/* BOLT #4:
+	 *
+	 * If the amount paid is less than the amount expected, the final node
+	 * MUST fail the HTLC.  If the amount paid is more than the amount
+	 * expected, the final node SHOULD fail the HTLC:
+	 *
+	 * 1. type: PERM|16 (`incorrect_payment_amount`)
+	 */
+	if (hend->msatoshis < invoice->msatoshi) {
+		fail_htlc(hend->peer, hend->htlc_id,
+			  take(towire_incorrect_payment_amount(hend)));
+		return;
+	} else if (hend->msatoshis > invoice->msatoshi * 2) {
+		fail_htlc(hend->peer, hend->htlc_id,
+			  take(towire_incorrect_payment_amount(hend)));
+		return;
+	}
+
+	/* BOLT #4:
+	 *
+	 * If the `cltv-expiry` is too low, the final node MUST fail the HTLC:
+	 */
+	if (get_block_height(hend->peer->ld->topology)
+	    + hend->peer->ld->dstate.config.deadline_blocks >= cltv_expiry) {
+		log_debug(hend->peer->log,
+			  "Expiry cltv %u too close to current %u + deadline %u",
+			  cltv_expiry,
+			  get_block_height(hend->peer->ld->topology),
+			  hend->peer->ld->dstate.config.deadline_blocks);
+		fail_htlc(hend->peer, hend->htlc_id,
+			  take(towire_final_expiry_too_soon(hend)));
+		tal_free(hend);
+		return;
+	}
+
+	/* FIXME: fail the peer if it doesn't tell us that htlc fulfill is
+	 * committed before deadline.
+	 */
+	connect_htlc_end(&hend->peer->ld->htlc_ends, hend);
+
+	log_info(hend->peer->ld->log, "Resolving invoice '%s' with HTLC %"PRIu64,
+		 invoice->label, hend->htlc_id);
+
+	hend->peer->balance[LOCAL] += hend->msatoshis;
+	hend->peer->balance[REMOTE] -= hend->msatoshis;
+
+	msg = towire_channel_fulfill_htlc(hend->peer, hend->htlc_id, &invoice->r);
+	subd_send_msg(hend->peer->owner, take(msg));
+	resolve_invoice(&hend->peer->ld->dstate, invoice);
+}
+
+static int peer_accepted_htlc(struct peer *peer, const u8 *msg)
+{
+	u64 id;
+	u32 cltv_expiry, amount_msat;
+	struct sha256 payment_hash;
+	u8 next_onion[TOTAL_PACKET_SIZE];
+	bool forward;
+	u64 amt_to_forward;
+	u32 outgoing_cltv_value;
+	struct htlc_end *hend;
+
+	if (!fromwire_channel_accepted_htlc(msg, NULL, &id, &amount_msat,
+					    &cltv_expiry, &payment_hash,
+					    next_onion, &forward,
+					    &amt_to_forward,
+					    &outgoing_cltv_value)) {
+		log_broken(peer->log, "bad fromwire_channel_accepted_htlc %s",
+			   tal_hex(peer, msg));
+		return -1;
+	}
+
+	hend = tal(peer, struct htlc_end);
+	hend->which_end = HTLC_SRC;
+	hend->peer = peer;
+	hend->htlc_id = id;
+	hend->other_end = NULL;
+	hend->pay_command = NULL;
+	hend->msatoshis = amount_msat;
+
+	if (forward)
+		log_broken(peer->log, "FIXME: Implement forwarding!");
+	else
+		handle_localpay(hend, cltv_expiry, &payment_hash);
+	return 0;
+}
+
+static int peer_fulfilled_htlc(struct peer *peer, const u8 *msg)
+{
+	u64 id;
+	struct preimage preimage;
+	struct htlc_end *hend;
+
+	if (!fromwire_channel_fulfilled_htlc(msg, NULL, &id, &preimage)) {
+		log_broken(peer->log, "bad fromwire_channel_fulfilled_htlc %s",
+			   tal_hex(peer, msg));
+		return -1;
+	}
+
+	hend = find_htlc_end(&peer->ld->htlc_ends, peer, id, HTLC_DST);
+	if (!hend) {
+		log_broken(peer->log,
+			   "channel_fulfilled_htlc unknown htlc %"PRIu64,
+			   id);
+		return -1;
+	}
+
+	/* They fulfilled our HTLC.  Credit them, forward as required. */
+	peer->balance[REMOTE] += hend->msatoshis;
+	peer->balance[LOCAL] -= hend->msatoshis;
+
+	/* FIXME: Forward! */
+	assert(!hend->other_end);
+
+	payment_succeeded(peer->ld, hend, &preimage);
+	tal_free(hend);
+
+	return 0;
+}
+
+static int peer_failed_htlc(struct peer *peer, const u8 *msg)
+{
+	u64 id;
+	u8 *reason;
+	struct htlc_end *hend;
+	enum onion_type failcode;
+
+	if (!fromwire_channel_failed_htlc(msg, msg, NULL, &id, &reason)) {
+		log_broken(peer->log, "bad fromwire_channel_failed_htlc %s",
+			   tal_hex(peer, msg));
+		return -1;
+	}
+
+	hend = find_htlc_end(&peer->ld->htlc_ends, peer, id, HTLC_DST);
+	if (!hend) {
+		log_broken(peer->log,
+			   "channel_failed_htlc unknown htlc %"PRIu64,
+			   id);
+		return -1;
+	}
+
+	/* FIXME: Decrypt reason, determine sender! */
+	failcode = fromwire_peektype(reason);
+
+	log_info(peer->log, "htlc %"PRIu64" failed with code 0x%04x (%s)",
+		 id, failcode, onion_type_name(failcode));
+
+	/* FIXME: Forward! */
+	assert(!hend->other_end);
+
+	payment_failed(peer->ld, hend, NULL, failcode);
+	tal_free(hend);
+
+	return 0;
+}
+
+static int channel_msg(struct subd *sd, const u8 *msg, const int *unused)
 {
 	enum channel_wire_type t = fromwire_peektype(msg);
 
@@ -606,23 +838,76 @@ static enum subd_msg_ret update_channel_status(struct subd *sd,
 	case WIRE_CHANNEL_NORMAL_OPERATION:
 		peer_set_condition(sd->peer, "Normal operation");
 		break;
+	case WIRE_CHANNEL_ACCEPTED_HTLC:
+		return peer_accepted_htlc(sd->peer, msg);
+	case WIRE_CHANNEL_FULFILLED_HTLC:
+		return peer_fulfilled_htlc(sd->peer, msg);
+	case WIRE_CHANNEL_FAILED_HTLC:
+		return peer_failed_htlc(sd->peer, msg);
+	case WIRE_CHANNEL_MALFORMED_HTLC:
+		/* FIXME: Forward. */
+		abort();
+		break;
+
 	/* We never see fatal ones. */
 	case WIRE_CHANNEL_BAD_COMMAND:
 	case WIRE_CHANNEL_HSM_FAILED:
+	case WIRE_CHANNEL_CRYPTO_FAILED:
+	case WIRE_CHANNEL_INTERNAL_ERROR:
 	case WIRE_CHANNEL_PEER_WRITE_FAILED:
 	case WIRE_CHANNEL_PEER_READ_FAILED:
 	case WIRE_CHANNEL_PEER_BAD_MESSAGE:
 	/* And we never get these from channeld. */
 	case WIRE_CHANNEL_INIT:
 	case WIRE_CHANNEL_FUNDING_LOCKED:
+	case WIRE_CHANNEL_FUNDING_ANNOUNCE_DEPTH:
+	case WIRE_CHANNEL_OFFER_HTLC:
+	case WIRE_CHANNEL_FULFILL_HTLC:
+	case WIRE_CHANNEL_FAIL_HTLC:
+	case WIRE_CHANNEL_PING:
+	/* Replies go to requests. */
+	case WIRE_CHANNEL_OFFER_HTLC_REPLY:
+	case WIRE_CHANNEL_PING_REPLY:
 		break;
 	}
 
-	return SUBD_COMPLETE;
+	return 0;
+}
+
+struct channeld_start {
+	struct peer *peer;
+	const u8 *initmsg;
+};
+
+/* We've got fd from HSM for channeld */
+static bool peer_start_channeld_hsmfd(struct subd *hsm, const u8 *resp,
+				      const int *fds,
+				      struct channeld_start *cds)
+{
+	cds->peer->owner = new_subd(cds->peer->ld, cds->peer->ld,
+				    "lightningd_channel", cds->peer,
+				    channel_wire_type_name,
+				    channel_msg, NULL,
+				    cds->peer->fd,
+				    cds->peer->gossip_client_fd, fds[0], -1);
+	if (!cds->peer->owner) {
+		log_unusual(cds->peer->log, "Could not subdaemon channel: %s",
+			    strerror(errno));
+		peer_set_condition(cds->peer, "Failed to subdaemon channel");
+		tal_free(cds->peer);
+		return true;
+	}
+	cds->peer->fd = -1;
+
+	peer_set_condition(cds->peer, "Waiting for funding confirmations");
+	/* We don't expect a response: we are triggered by funding_depth_cb. */
+	subd_send_msg(cds->peer->owner, take(cds->initmsg));
+	tal_free(cds);
+	return true;
 }
 
 /* opening is done, start lightningd_channel for peer. */
-static void peer_start_channeld(struct peer *peer, bool am_funder,
+static void peer_start_channeld(struct peer *peer, enum side funder,
 				const struct channel_config *their_config,
 				const struct crypto_state *crypto_state,
 				const secp256k1_ecdsa_signature *commit_sig,
@@ -630,48 +915,52 @@ static void peer_start_channeld(struct peer *peer, bool am_funder,
 				const struct basepoints *theirbase,
 				const struct pubkey *their_per_commit_point)
 {
-	u8 *msg;
+	struct channeld_start *cds = tal(peer, struct channeld_start);
 
-	/* Normal channel daemon. */
-	peer->owner = new_subd(peer->ld, peer->ld,
-			       "lightningd_channel", peer,
-			       channel_wire_type_name,
-			       update_channel_status, NULL,
-			       peer->fd, -1);
-	if (!peer->owner) {
-		log_unusual(peer->log, "Could not subdaemon channel: %s",
-			    strerror(errno));
-		peer_set_condition(peer, "Failed to subdaemon channel");
-		tal_free(peer);
-		return;
-	}
-	peer->fd = -1;
+	/* Unowned: back to being owned by main daemon. */
+	peer->owner = NULL;
+	tal_steal(peer->ld, peer);
 
-	peer_set_condition(peer, "Waiting for funding confirmations");
-	msg = towire_channel_init(peer,
-				  peer->funding_txid,
-				  peer->funding_outnum,
-				  &peer->our_config,
-				  their_config,
-				  commit_sig,
-				  crypto_state,
-				  remote_fundingkey,
-				  &theirbase->revocation,
-				  &theirbase->payment,
-				  &theirbase->delayed_payment,
-				  their_per_commit_point,
-				  am_funder,
-				  /* FIXME: real feerate! */
-				  15000,
-				  peer->funding_satoshi,
-				  peer->push_msat,
-				  peer->seed);
+	peer_set_condition(peer, "Waiting for HSM file descriptor");
 
-	/* We don't expect a response: we are triggered by funding_depth_cb. */
-	subd_send_msg(peer->owner, take(msg));
+	/* Now we can consider balance set. */
+	peer->balance = tal_arr(peer, u64, NUM_SIDES);
+	peer->balance[funder] = peer->funding_satoshi * 1000 - peer->push_msat;
+	peer->balance[!funder] = peer->push_msat;
+
+	cds->peer = peer;
+	/* Prepare init message now while we have access to all the data. */
+	cds->initmsg = towire_channel_init(cds,
+					   peer->funding_txid,
+					   peer->funding_outnum,
+					   &peer->our_config,
+					   their_config,
+					   commit_sig,
+					   crypto_state,
+					   remote_fundingkey,
+					   &theirbase->revocation,
+					   &theirbase->payment,
+					   &theirbase->delayed_payment,
+					   their_per_commit_point,
+					   funder == LOCAL,
+					   /* FIXME: real feerate! */
+					   15000,
+					   peer->funding_satoshi,
+					   peer->push_msat,
+					   peer->seed,
+					   &peer->ld->dstate.id,
+					   peer->id,
+					   time_to_msec(peer->ld->dstate.config
+							.commit_time));
+
+	/* Get fd from hsm. */
+	subd_req(peer, peer->ld->hsm,
+		 take(towire_hsmctl_hsmfd_channeld(peer, peer->unique_id)),
+		 -1, 1, peer_start_channeld_hsmfd, cds);
 }
 
 static bool opening_release_tx(struct subd *opening, const u8 *resp,
+			       const int *fds,
 			       struct funding_channel *fc)
 {
 	u8 *msg;
@@ -684,6 +973,9 @@ static bool opening_release_tx(struct subd *opening, const u8 *resp,
 	/* FIXME: marshal code wants array, not array of pointers. */
 	struct utxo *utxos = tal_arr(fc, struct utxo, tal_count(fc->utxomap));
 
+	assert(tal_count(fds) == 1);
+	fc->peer->fd = fds[0];
+
 	if (!fromwire_opening_open_funding_reply(resp, NULL,
 						 &their_config,
 						 &commit_sig,
@@ -691,7 +983,8 @@ static bool opening_release_tx(struct subd *opening, const u8 *resp,
 						 &theirbase.revocation,
 						 &theirbase.payment,
 						 &theirbase.delayed_payment,
-						 &their_per_commit_point)) {
+						 &their_per_commit_point,
+						 &fc->peer->minimum_depth)) {
 		log_broken(fc->peer->log, "bad OPENING_OPEN_FUNDING_REPLY %s",
 			   tal_hex(resp, resp));
 		tal_free(fc->peer);
@@ -709,11 +1002,11 @@ static bool opening_release_tx(struct subd *opening, const u8 *resp,
 					 &fc->remote_fundingkey,
 					 utxos);
 	tal_free(utxos);
-	subd_req(fc->peer->ld->hsm, take(msg), -1, NULL,
+	subd_req(fc, fc->peer->ld->hsm, take(msg), -1, 0,
 		 opening_got_hsm_funding_sig, fc);
 
 	/* Start normal channel daemon. */
-	peer_start_channeld(fc->peer, true,
+	peer_start_channeld(fc->peer, LOCAL,
 			    &their_config, &crypto_state, &commit_sig,
 			    &fc->remote_fundingkey, &theirbase,
 			    &their_per_commit_point);
@@ -723,7 +1016,7 @@ static bool opening_release_tx(struct subd *opening, const u8 *resp,
 }
 
 static bool opening_gen_funding(struct subd *opening, const u8 *reply,
-				struct funding_channel *fc)
+				const int *fds, struct funding_channel *fc)
 {
 	u8 *msg;
 	struct pubkey changekey;
@@ -754,13 +1047,13 @@ static bool opening_gen_funding(struct subd *opening, const u8 *reply,
 
 	msg = towire_opening_open_funding(fc, fc->peer->funding_txid,
 					  fc->peer->funding_outnum);
-	subd_req(fc->peer->owner, take(msg), -1, &fc->peer->fd,
-		 opening_release_tx, fc);
+	subd_req(fc, fc->peer->owner, take(msg), -1, 1, opening_release_tx, fc);
 	return true;
 }
 
 static bool opening_accept_finish_response(struct subd *opening,
 					   const u8 *reply,
+					   const int *fds,
 					   struct peer *peer)
 {
 	struct channel_config their_config;
@@ -770,6 +1063,9 @@ static bool opening_accept_finish_response(struct subd *opening,
 	struct pubkey remote_fundingkey, their_per_commit_point;
 
 	log_debug(peer->log, "Got opening_accept_finish_response");
+	assert(tal_count(fds) == 1);
+	peer->fd = fds[0];
+
 	if (!fromwire_opening_accept_finish_reply(reply, NULL,
 						  &peer->funding_outnum,
 						  &their_config,
@@ -788,7 +1084,7 @@ static bool opening_accept_finish_response(struct subd *opening,
 	}
 
 	/* On to normal operation! */
-	peer_start_channeld(peer, false, &their_config, &crypto_state,
+	peer_start_channeld(peer, REMOTE, &their_config, &crypto_state,
 			    &first_commit_sig, &remote_fundingkey, &theirbase,
 			    &their_per_commit_point);
 
@@ -797,6 +1093,7 @@ static bool opening_accept_finish_response(struct subd *opening,
 }
 
 static bool opening_accept_reply(struct subd *opening, const u8 *reply,
+				 const int *fds,
 				 struct peer *peer)
 {
 	peer->funding_txid = tal(peer, struct sha256_double);
@@ -813,8 +1110,8 @@ static bool opening_accept_reply(struct subd *opening, const u8 *reply,
 		   funding_depth_cb, NULL);
 
 	/* Tell it we're watching. */
-	subd_req(opening, towire_opening_accept_finish(reply),
-		 -1, &peer->fd,
+	subd_req(peer, opening, towire_opening_accept_finish(reply),
+		 -1, 1,
 		 opening_accept_finish_response, peer);
 	return true;
 }
@@ -839,13 +1136,6 @@ static void channel_config(struct lightningd *ld,
 	 */
 	ours->dust_limit_satoshis = 546;
 	ours->max_htlc_value_in_flight_msat = UINT64_MAX;
-
-	/* BOLT #2:
-	 *
-	 * The sender SHOULD set `minimum-depth` to an amount where
-	 * the sender considers reorganizations to be low risk.
-	 */
-	ours->minimum_depth = ld->dstate.config.anchor_confirms;
 
 	/* Don't care */
 	ours->htlc_minimum_msat = 0;
@@ -903,6 +1193,13 @@ void peer_accept_open(struct peer *peer,
 	/* We handed off peer fd */
 	peer->fd = -1;
 
+	/* BOLT #2:
+	 *
+	 * The sender SHOULD set `minimum-depth` to an amount where
+	 * the sender considers reorganizations to be low risk.
+	 */
+	peer->minimum_depth = ld->dstate.config.anchor_confirms;
+
 	channel_config(ld, &peer->our_config,
 		       &max_to_self_delay, &max_minimum_depth,
 		       &min_effective_htlc_capacity_msat);
@@ -915,7 +1212,8 @@ void peer_accept_open(struct peer *peer,
 				  cs, peer->seed);
 
 	subd_send_msg(peer->owner, take(msg));
-	msg = towire_opening_accept(peer, 7500, 150000, from_peer);
+	msg = towire_opening_accept(peer, peer->minimum_depth,
+				    7500, 150000, from_peer);
 
 	/* Careful here!  Their message could push us overlength! */
 	if (tal_len(msg) >= 65536) {
@@ -923,12 +1221,13 @@ void peer_accept_open(struct peer *peer,
 		tal_free(peer);
 		return;
 	}
-	subd_req(peer->owner, take(msg), -1, NULL, opening_accept_reply, peer);
+	subd_req(peer, peer->owner, take(msg), -1, 0, opening_accept_reply, peer);
 }
 
 /* Peer has been released from gossip.  Start opening. */
 static bool gossip_peer_released(struct subd *gossip,
 				 const u8 *resp,
+				 const int *fds,
 				 struct funding_channel *fc)
 {
 	struct lightningd *ld = fc->peer->ld;
@@ -937,6 +1236,10 @@ static bool gossip_peer_released(struct subd *gossip,
 	u64 id;
 	u8 *msg;
 	struct subd *opening;
+
+	assert(tal_count(fds) == 2);
+	fc->peer->fd = fds[0];
+	fc->peer->gossip_client_fd = fds[1];
 
 	fc->cs = tal(fc, struct crypto_state);
 	if (!fromwire_gossipctl_release_peer_reply(resp, NULL, &id, fc->cs))
@@ -985,7 +1288,7 @@ static bool gossip_peer_released(struct subd *gossip,
 	msg = towire_opening_open(fc, fc->peer->funding_satoshi,
 				  fc->peer->push_msat,
 				  15000, max_minimum_depth);
-	subd_req(opening, take(msg), -1, NULL, opening_gen_funding, fc);
+	subd_req(fc, opening, take(msg), -1, 0, opening_gen_funding, fc);
 	return true;
 }
 
@@ -1006,7 +1309,7 @@ static void json_fund_channel(struct command *cmd,
 	}
 
 	fc->cmd = cmd;
-	fc->peer = find_peer_json(ld, buffer, peertok);
+	fc->peer = peer_from_json(ld, buffer, peertok);
 	if (!fc->peer) {
 		command_fail(cmd, "Could not find peer with that peerid");
 		return;
@@ -1035,8 +1338,7 @@ static void json_fund_channel(struct command *cmd,
 	/* Tie this fc lifetime (and hence utxo release) to the peer */
 	tal_steal(fc->peer, fc);
 	tal_add_destructor(fc, fail_fundchannel_command);
-	subd_req(ld->gossip, msg, -1, &fc->peer->fd,
-		 gossip_peer_released, fc);
+	subd_req(fc, ld->gossip, msg, -1, 2, gossip_peer_released, fc);
 }
 
 static const struct json_command fund_channel_command = {

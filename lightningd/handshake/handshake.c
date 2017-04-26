@@ -1,4 +1,3 @@
-#include "status.h"
 #include "type_to_string.h"
 #include <assert.h>
 #include <bitcoin/privkey.h>
@@ -13,6 +12,7 @@
 #include <lightningd/debug.h>
 #include <lightningd/handshake/gen_handshake_wire.h>
 #include <lightningd/hsm/client.h>
+#include <lightningd/status.h>
 #include <secp256k1.h>
 #include <secp256k1_ecdh.h>
 #include <sodium/crypto_aead_chacha20poly1305.h>
@@ -308,7 +308,7 @@ static void act_one_initiator(struct handshake *h, int fd,
 	struct act_one act1;
 	size_t len;
 
-	status_send(towire_initr_act_one(h));
+	status_send_sync(towire_initr_act_one(h));
 
 	/* BOLT #8:
 	 *
@@ -390,7 +390,7 @@ static void act_one_responder(struct handshake *h, int fd, struct pubkey *re)
 {
 	struct act_one act1;
 
-	status_send(towire_respr_act_one(h));
+	status_send_sync(towire_respr_act_one(h));
 
 	/* BOLT #8:
 	 *
@@ -519,7 +519,7 @@ static void act_two_responder(struct handshake *h, int fd,
 	struct act_two act2;
 	size_t len;
 
-	status_send(towire_respr_act_two(h));
+	status_send_sync(towire_respr_act_two(h));
 
 	/* BOLT #8:
 	 *
@@ -602,7 +602,7 @@ static void act_two_initiator(struct handshake *h, int fd, struct pubkey *re)
 {
 	struct act_two act2;
 
-	status_send(towire_initr_act_two(h));
+	status_send_sync(towire_initr_act_two(h));
 
 	/* BOLT #8:
 	 *
@@ -731,7 +731,7 @@ static void act_three_initiator(struct handshake *h, int fd,
 	u8 spub[PUBKEY_DER_LEN];
 	size_t len = sizeof(spub);
 
-	status_send(towire_initr_act_three(h));
+	status_send_sync(towire_initr_act_three(h));
 
 	/* BOLT #8:
 	 *   * `c = encryptWithAD(temp_k2, 1, h, s.pub.serializeCompressed())`
@@ -803,7 +803,7 @@ static void act_three_responder(struct handshake *h, int fd,
 	struct act_three act3;
 	u8 der[PUBKEY_DER_LEN];
 
-	status_send(towire_respr_act_three(h));
+	status_send_sync(towire_respr_act_three(h));
 
 	/* BOLT #8:
 	 *
@@ -979,7 +979,7 @@ int main(int argc, char *argv[])
 	subdaemon_debug(argc, argv);
 	secp256k1_ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY
 						 | SECP256K1_CONTEXT_SIGN);
-	status_setup(REQ_FD);
+	status_setup_sync(REQ_FD);
 
 	hsm_setup(hsmfd);
 

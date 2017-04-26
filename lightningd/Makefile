@@ -14,7 +14,7 @@ LIGHTNINGD_OLD_SRC :=				\
 	daemon/chaintopology.c			\
 	daemon/configdir.c			\
 	daemon/dns.c				\
-	daemon/netaddr.c			\
+	daemon/invoice.c			\
 	daemon/json.c				\
 	daemon/jsonrpc.c			\
 	daemon/log.c				\
@@ -23,14 +23,15 @@ LIGHTNINGD_OLD_SRC :=				\
 	daemon/opt_time.c			\
 	daemon/pseudorand.c			\
 	daemon/routing.c			\
-	daemon/timeout.c			\
 	daemon/watch.c
 LIGHTNINGD_OLD_OBJS := $(LIGHTNINGD_OLD_SRC:.c=.o)
 LIGHTNINGD_OLD_HEADERS := $(LIGHTNINGD_OLD_SRC:.c=.h)
 
 LIGHTNINGD_OLD_LIB_SRC :=			\
 	daemon/htlc_state.c			\
-	daemon/pseudorand.c
+	daemon/pseudorand.c			\
+	daemon/sphinx.c				\
+	daemon/timeout.c
 LIGHTNINGD_OLD_LIB_OBJS := $(LIGHTNINGD_OLD_LIB_SRC:.c=.o)
 LIGHTNINGD_OLD_LIB_HEADERS := $(LIGHTNINGD_OLD_LIB_SRC:.c=.h)
 
@@ -42,12 +43,16 @@ LIGHTNINGD_LIB_SRC :=				\
 	lightningd/cryptomsg.c			\
 	lightningd/crypto_sync.c		\
 	lightningd/debug.c			\
+	lightningd/daemon_conn.c		\
 	lightningd/derive_basepoints.c		\
 	lightningd/funding_tx.c			\
+	lightningd/gossip_msg.c			\
 	lightningd/htlc_tx.c			\
 	lightningd/key_derive.c			\
 	lightningd/msg_queue.c			\
 	lightningd/peer_failed.c		\
+	lightningd/ping.c			\
+	lightningd/status.c			\
 	lightningd/utxo.c
 
 LIGHTNINGD_LIB_OBJS := $(LIGHTNINGD_LIB_SRC:.c=.o)
@@ -55,9 +60,13 @@ LIGHTNINGD_LIB_HEADERS := $(LIGHTNINGD_LIB_SRC:.c=.h)
 
 LIGHTNINGD_SRC :=				\
 	lightningd/build_utxos.c		\
+	lightningd/dev_newhtlc.c		\
+	lightningd/dev_ping.c			\
 	lightningd/gossip_control.c		\
+	lightningd/htlc_end.c			\
 	lightningd/hsm_control.c		\
 	lightningd/lightningd.c			\
+	lightningd/pay.c			\
 	lightningd/peer_control.c		\
 	lightningd/subd.c
 
@@ -71,7 +80,9 @@ LIGHTNINGD_HEADERS_NOGEN =			\
 	lightningd/build_utxos.h		\
 	lightningd/gossip_control.h		\
 	lightningd/hsm_control.h		\
+	lightningd/htlc_end.h			\
 	lightningd/lightningd.h			\
+	lightningd/pay.h			\
 	lightningd/peer_control.h		\
 	lightningd/subd.h			\
 	$(LIGHTNINGD_OLD_LIB_HEADERS)		\
@@ -99,11 +110,11 @@ LIGHTNINGD_HEADERS = $(LIGHTNINGD_HEADERS_NOGEN) $(LIGHTNINGD_HEADERS_GEN) $(LIG
 
 # These included makefiles add their headers to the LIGHTNINGD_HEADERS
 # variable so the include must preceed any actual use of the variable.
-include lightningd/channel/Makefile
 include lightningd/hsm/Makefile
 include lightningd/handshake/Makefile
 include lightningd/gossip/Makefile
 include lightningd/opening/Makefile
+include lightningd/channel/Makefile
 
 $(LIGHTNINGD_OBJS) $(LIGHTNINGD_LIB_OBJS): $(LIGHTNINGD_HEADERS) 
 
@@ -119,7 +130,7 @@ check-makefile: check-lightningd-makefile
 check-lightningd-makefile:
 	@for f in lightningd/*.h lightningd/*/*.h; do if ! echo $(LIGHTNINGD_HEADERS_NOGEN) $(LIGHTNINGD_HEADERS_GEN) "" | grep -q "$$f "; then echo $$f not mentioned in LIGHTNINGD_HEADERS_NOGEN or LIGHTNINGD_HEADERS_GEN >&2; exit 1; fi; done
 
-lightningd/lightningd: $(LIGHTNINGD_OBJS) $(LIGHTNINGD_OLD_OBJS) $(LIGHTNINGD_OLD_LIB_OBJS) $(LIGHTNINGD_LIB_OBJS) $(LIGHTNINGD_JSMN_OBJS) $(CORE_OBJS) $(CORE_TX_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(CCAN_OBJS) $(LIGHTNINGD_HSM_CONTROL_OBJS) $(LIGHTNINGD_HANDSHAKE_CONTROL_OBJS) $(LIGHTNINGD_GOSSIP_CONTROL_OBJS) $(LIBBASE58_OBJS) $(LIGHTNINGD_OPENING_CONTROL_OBJS) $(LIGHTNINGD_CHANNEL_CONTROL_OBJS) libsecp256k1.a libsodium.a libwallycore.a
+lightningd/lightningd: $(LIGHTNINGD_OBJS) $(LIGHTNINGD_OLD_OBJS) $(LIGHTNINGD_OLD_LIB_OBJS) $(LIGHTNINGD_LIB_OBJS) $(LIGHTNINGD_JSMN_OBJS) $(CORE_OBJS) $(CORE_TX_OBJS) $(BITCOIN_OBJS) $(WIRE_OBJS) $(WIRE_ONION_OBJS) $(CCAN_OBJS) $(CCAN_SHACHAIN48_OBJ) $(LIGHTNINGD_HSM_CONTROL_OBJS) $(LIGHTNINGD_HANDSHAKE_CONTROL_OBJS) $(LIGHTNINGD_GOSSIP_CONTROL_OBJS) $(LIBBASE58_OBJS) $(LIGHTNINGD_OPENING_CONTROL_OBJS) $(LIGHTNINGD_CHANNEL_CONTROL_OBJS) libsecp256k1.a libsodium.a libwallycore.a
 
 clean: lightningd-clean
 

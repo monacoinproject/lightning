@@ -30,16 +30,20 @@ char *bitcoin_datadir;
 
 #define FIXME_IMPLEMENT() errx(1, "FIXME: Implement %s", __func__)
 
-/* FIXME: Implement */
-struct invoices *invoices_init(struct lightningd_state *dstate)
-{
-	return NULL;
-}
-
 struct peer *find_peer(struct lightningd_state *dstate, const struct pubkey *id);
 struct peer *find_peer(struct lightningd_state *dstate, const struct pubkey *id)
 {
 	FIXME_IMPLEMENT();
+}
+
+struct peer *find_peer_by_unique_id(struct lightningd *ld, u64 unique_id)
+{
+	struct peer *peer;
+	list_for_each(&ld->peers, peer, list) {
+		if (peer->unique_id == unique_id)
+			return peer;
+	}
+	return NULL;
 }
 
 void peer_debug(struct peer *peer, const char *fmt, ...);
@@ -60,6 +64,34 @@ void notify_new_block(struct chain_topology *topo, u32 height)
 	/* FIXME */
 }
 
+void db_resolve_invoice(struct lightningd_state *dstate,
+			const char *label, u64 paid_num);
+void db_resolve_invoice(struct lightningd_state *dstate,
+			const char *label, u64 paid_num)
+{
+	/* FIXME */
+}
+
+bool db_new_invoice(struct lightningd_state *dstate,
+		    u64 msatoshi,
+		    const char *label,
+		    const struct preimage *r);
+bool db_new_invoice(struct lightningd_state *dstate,
+		    u64 msatoshi,
+		    const char *label,
+		    const struct preimage *r)
+{
+	/* FIXME */
+	return true;
+}
+
+bool db_remove_invoice(struct lightningd_state *dstate, const char *label);
+bool db_remove_invoice(struct lightningd_state *dstate,
+		       const char *label)
+{
+	/* FIXME */
+	return true;
+}
 
  #include <daemon/packets.h>
 void queue_pkt_nested(struct peer *peer,
@@ -78,6 +110,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->bip32_max_index = 0;
 	ld->dev_debug_subdaemon = NULL;
 	list_head_init(&ld->utxos);
+	htlc_end_map_init(&ld->htlc_ends);
 	ld->dstate.log_book = new_log_book(&ld->dstate, 20*1024*1024,LOG_INFORM);
 	ld->log = ld->dstate.base_log = new_log(&ld->dstate,
 						ld->dstate.log_book,
@@ -98,6 +131,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->topology = ld->dstate.topology = new_topology(ld, ld->log);
 	ld->bitcoind = ld->dstate.bitcoind = new_bitcoind(ld, ld->log);
 
+	/* FIXME: Move into invoice daemon. */
 	ld->dstate.invoices = invoices_init(&ld->dstate);
 	return ld;
 }
@@ -163,6 +197,20 @@ void derive_peer_seed(struct lightningd *ld, struct privkey *peer_seed,
 	ld->peer_counter++;
 }
 
+static void shutdown_subdaemons(struct lightningd *ld)
+{
+	struct peer *p;
+
+	/* Let everyone shutdown cleanly. */
+	subd_shutdown(ld->hsm, 10);
+	subd_shutdown(ld->gossip, 10);
+
+	/* Duplicates are OK: no need to check here. */
+	list_for_each(&ld->peers, p, list)
+		if (p->owner)
+			subd_shutdown(p->owner, 0);
+}
+
 int main(int argc, char *argv[])
 {
 	struct lightningd *ld = new_lightningd(NULL);
@@ -216,7 +264,6 @@ int main(int argc, char *argv[])
 #if 0
 	/* Load peers from database. */
 	db_load_peers(dstate);
-
 #endif
 
 	for (;;) {
@@ -230,6 +277,8 @@ int main(int argc, char *argv[])
 		if (expired)
 			timer_expired(&ld->dstate, expired);
 	}
+
+	shutdown_subdaemons(ld);
 
 	tal_free(ld);
 	opt_free_table();

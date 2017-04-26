@@ -20,6 +20,10 @@ struct channel_id {
 struct ipv6 {
 	u8 addr[16];
 };
+struct preimage;
+
+void derive_channel_id(struct channel_id *channel_id,
+		       struct sha256_double *txid, u16 txout);
 
 /* Read the type; returns -1 if not long enough.  cursor is a tal ptr. */
 int fromwire_peektype(const u8 *cursor);
@@ -34,6 +38,7 @@ void towire_short_channel_id(u8 **pptr,
 			     const struct short_channel_id *short_channel_id);
 void towire_sha256(u8 **pptr, const struct sha256 *sha256);
 void towire_sha256_double(u8 **pptr, const struct sha256_double *sha256d);
+void towire_preimage(u8 **pptr, const struct preimage *preimage);
 void towire_ipv6(u8 **pptr, const struct ipv6 *ipv6);
 void towire_u8(u8 **pptr, u8 v);
 void towire_u16(u8 **pptr, u16 v);
@@ -43,14 +48,6 @@ void towire_pad(u8 **pptr, size_t num);
 void towire_bool(u8 **pptr, bool v);
 
 void towire_u8_array(u8 **pptr, const u8 *arr, size_t num);
-void towire_u32_array(u8 **pptr, const u32 *arr, size_t num);
-void towire_u64_array(u8 **pptr, const u64 *arr, size_t num);
-void towire_bool_array(u8 **pptr, const bool *arr, size_t num);
-void towire_secp256k1_ecdsa_signature_array(u8 **pptr,
-			const secp256k1_ecdsa_signature *arr, size_t num);
-void towire_sha256_double_array(u8 **pptr,
-				const struct sha256_double *arr, size_t num);
-
 
 const u8 *fromwire(const u8 **cursor, size_t *max, void *copy, size_t n);
 u8 fromwire_u8(const u8 **cursor, size_t *max);
@@ -69,16 +66,9 @@ void fromwire_short_channel_id(const u8 **cursor, size_t *max,
 void fromwire_sha256(const u8 **cursor, size_t *max, struct sha256 *sha256);
 void fromwire_sha256_double(const u8 **cursor, size_t *max,
 			    struct sha256_double *sha256d);
+void fromwire_preimage(const u8 **cursor, size_t *max, struct preimage *preimage);
 void fromwire_ipv6(const u8 **cursor, size_t *max, struct ipv6 *ipv6);
 void fromwire_pad(const u8 **cursor, size_t *max, size_t num);
 
 void fromwire_u8_array(const u8 **cursor, size_t *max, u8 *arr, size_t num);
-void fromwire_u32_array(const u8 **cursor, size_t *max, u32 *arr, size_t num);
-void fromwire_u64_array(const u8 **cursor, size_t *max, u64 *arr, size_t num);
-void fromwire_bool_array(const u8 **cursor, size_t *max, bool *arr, size_t num);
-
-void fromwire_secp256k1_ecdsa_signature_array(const u8 **cursor, size_t *max,
-			      secp256k1_ecdsa_signature *arr, size_t num);
-void fromwire_sha256_double_array(const u8 **cursor, size_t *max,
-				  struct sha256_double *arr, size_t num);
 #endif /* LIGHTNING_WIRE_WIRE_H */

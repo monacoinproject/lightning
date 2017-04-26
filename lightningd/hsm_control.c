@@ -10,7 +10,7 @@
 #include <lightningd/hsm/gen_hsm_wire.h>
 #include <wally_bip32.h>
 
-static bool hsm_init_done(struct subd *hsm, const u8 *msg,
+static bool hsm_init_done(struct subd *hsm, const u8 *msg, const int *fds,
 			  struct lightningd *ld)
 {
 	u8 *serialized_extkey;
@@ -38,7 +38,7 @@ static void hsm_finished(struct subd *hsm, int status)
 	errx(1, "HSM failed (signal %u), exiting.", WTERMSIG(status));
 }
 
-static enum subd_msg_ret hsm_msg(struct subd *hsm, const u8 *msg, int fd)
+static int hsm_msg(struct subd *hsm, const u8 *msg, const int *fds)
 {
 	enum hsm_wire_type t = fromwire_peektype(msg);
 	u8 *badmsg;
@@ -71,15 +71,17 @@ static enum subd_msg_ret hsm_msg(struct subd *hsm, const u8 *msg, int fd)
 	/* HSM doesn't send these */
 	case WIRE_HSMCTL_INIT:
 	case WIRE_HSMCTL_HSMFD_ECDH:
+	case WIRE_HSMCTL_HSMFD_CHANNELD:
 	case WIRE_HSMCTL_SIGN_FUNDING:
 
 	/* Replies should be paired to individual requests. */
 	case WIRE_HSMCTL_INIT_REPLY:
+	case WIRE_HSMCTL_HSMFD_CHANNELD_REPLY:
 	case WIRE_HSMCTL_HSMFD_ECDH_FD_REPLY:
 	case WIRE_HSMCTL_SIGN_FUNDING_REPLY:
 		errx(1, "HSM gave invalid message %s", hsm_wire_type_name(t));
 	}
-	return SUBD_COMPLETE;
+	return 0;
 }
 
 void hsm_init(struct lightningd *ld, bool newdir)
@@ -97,8 +99,8 @@ void hsm_init(struct lightningd *ld, bool newdir)
 	else
 		create = (access("hsm_secret", F_OK) != 0);
 
-	subd_req(ld->hsm, take(towire_hsmctl_init(ld->hsm, create)),
-		 -1, NULL, hsm_init_done, ld);
+	subd_req(ld->hsm, ld->hsm, take(towire_hsmctl_init(ld->hsm, create)),
+		 -1, 0, hsm_init_done, ld);
 
 	if (io_loop(NULL, NULL) != ld->hsm)
 		errx(1, "Unexpected io exit during HSM startup");

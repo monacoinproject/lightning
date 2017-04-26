@@ -4,11 +4,13 @@
 #include "subd.h"
 #include <ccan/err/err.h>
 #include <ccan/take/take.h>
+#include <ccan/tal/str/str.h>
 #include <daemon/jsonrpc.h>
 #include <daemon/log.h>
 #include <inttypes.h>
 #include <lightningd/cryptomsg.h>
 #include <lightningd/gossip/gen_gossip_wire.h>
+#include <lightningd/gossip_msg.h>
 #include <wire/gen_peer_wire.h>
 
 static void gossip_finished(struct subd *gossip, int status)
@@ -41,7 +43,30 @@ static void peer_bad_message(struct subd *gossip, const u8 *msg)
 	tal_free(peer);
 }
 
-static void peer_nongossip(struct subd *gossip, const u8 *msg, int fd)
+static void peer_failed(struct subd *gossip, const u8 *msg)
+{
+	u64 unique_id;
+	struct peer *peer;
+	u8 *err;
+
+	if (!fromwire_gossipstatus_peer_failed(msg, msg, NULL,
+					       &unique_id, &err))
+		fatal("Gossip gave bad PEER_FAILED message %s",
+		      tal_hex(msg, msg));
+
+	peer = peer_by_unique_id(gossip->ld, unique_id);
+	if (!peer)
+		fatal("Gossip gave bad peerid %"PRIu64, unique_id);
+
+	log_unusual(gossip->log, "Peer %s failed: %.*s",
+		    type_to_string(msg, struct pubkey, peer->id),
+		    (int)tal_len(err), (const char *)err);
+	peer_set_condition(peer, "Error during gossip phase");
+	tal_free(peer);
+}
+
+static void peer_nongossip(struct subd *gossip, const u8 *msg,
+			   int peer_fd, int gossip_fd)
 {
 	u64 unique_id;
 	struct peer *peer;
@@ -63,7 +88,8 @@ static void peer_nongossip(struct subd *gossip, const u8 *msg, int fd)
 
 	/* It returned the fd. */
 	assert(peer->fd == -1);
-	peer->fd = fd;
+	peer->fd = peer_fd;
+	peer->gossip_client_fd = gossip_fd;
 
 	peer_set_condition(peer, "Gossip ended up receipt of %s",
 			   wire_type_name(fromwire_peektype(inner)));
@@ -84,8 +110,9 @@ static void peer_ready(struct subd *gossip, const u8 *msg)
 	if (!peer)
 		fatal("Gossip gave bad peerid %"PRIu64, unique_id);
 
-	log_debug_struct(gossip->log, "Peer %s ready for channel open",
-			 struct pubkey, peer->id);
+	log_debug(gossip->log, "Peer %s (%"PRIu64") ready for channel open",
+		  type_to_string(msg, struct pubkey, peer->id),
+		  unique_id);
 
 	if (peer->connect_cmd) {
 		struct json_result *response;
@@ -101,8 +128,7 @@ static void peer_ready(struct subd *gossip, const u8 *msg)
 	peer_set_condition(peer, "Exchanging gossip");
 }
 
-static enum subd_msg_ret gossip_msg(struct subd *gossip,
-				    const u8 *msg, int fd)
+static int gossip_msg(struct subd *gossip, const u8 *msg, const int *fds)
 {
 	enum gossip_wire_type t = fromwire_peektype(msg);
 
@@ -116,22 +142,33 @@ static enum subd_msg_ret gossip_msg(struct subd *gossip,
 	/* These are messages we send, not them. */
 	case WIRE_GOSSIPCTL_NEW_PEER:
 	case WIRE_GOSSIPCTL_RELEASE_PEER:
+	case WIRE_GOSSIP_GETNODES_REQUEST:
+	case WIRE_GOSSIP_GETROUTE_REQUEST:
+	case WIRE_GOSSIP_GETCHANNELS_REQUEST:
+	case WIRE_GOSSIP_PING:
 	/* This is a reply, so never gets through to here. */
 	case WIRE_GOSSIPCTL_RELEASE_PEER_REPLY:
+	case WIRE_GOSSIP_GETNODES_REPLY:
+	case WIRE_GOSSIP_GETROUTE_REPLY:
+	case WIRE_GOSSIP_GETCHANNELS_REPLY:
+	case WIRE_GOSSIP_PING_REPLY:
 		break;
 	case WIRE_GOSSIPSTATUS_PEER_BAD_MSG:
 		peer_bad_message(gossip, msg);
 		break;
+	case WIRE_GOSSIPSTATUS_PEER_FAILED:
+		peer_failed(gossip, msg);
+		break;
 	case WIRE_GOSSIPSTATUS_PEER_NONGOSSIP:
-		if (fd == -1)
-			return SUBD_NEED_FD;
-		peer_nongossip(gossip, msg, fd);
+		if (tal_count(fds) != 2)
+			return 2;
+		peer_nongossip(gossip, msg, fds[0], fds[1]);
 		break;
 	case WIRE_GOSSIPSTATUS_PEER_READY:
 		peer_ready(gossip, msg);
 		break;
 	}
-	return SUBD_COMPLETE;
+	return 0;
 }
 
 void gossip_init(struct lightningd *ld)
@@ -142,3 +179,178 @@ void gossip_init(struct lightningd *ld)
 	if (!ld->gossip)
 		err(1, "Could not subdaemon gossip");
 }
+
+static bool json_getnodes_reply(struct subd *gossip, const u8 *reply,
+				const int *fds,
+				struct command *cmd)
+{
+	struct gossip_getnodes_entry *nodes;
+	struct json_result *response = new_json_result(cmd);
+	size_t i;
+
+	if (!fromwire_gossip_getnodes_reply(reply, reply, NULL, &nodes)) {
+		command_fail(cmd, "Malformed gossip_getnodes response");
+		return true;
+	}
+
+	json_object_start(response, NULL);
+	json_array_start(response, "nodes");
+
+	for (i = 0; i < tal_count(nodes); i++) {
+		json_object_start(response, NULL);
+		json_add_pubkey(response, "nodeid", &nodes[i].nodeid);
+		if (tal_len(nodes[i].hostname) > 0) {
+			json_add_string(response, "hostname", nodes[i].hostname);
+		} else {
+			json_add_null(response, "hostname");
+		}
+		json_add_num(response, "port", nodes[i].port);
+		json_object_end(response);
+	}
+	json_array_end(response);
+	json_object_end(response);
+	command_success(cmd, response);
+	return true;
+}
+
+static void json_getnodes(struct command *cmd, const char *buffer,
+			  const jsmntok_t *params)
+{
+	struct lightningd *ld = ld_from_dstate(cmd->dstate);
+	u8 *req = towire_gossip_getnodes_request(cmd);
+	subd_req(cmd, ld->gossip, req, -1, 0, json_getnodes_reply, cmd);
+}
+
+static const struct json_command getnodes_command = {
+    "getnodes", json_getnodes, "Retrieve all nodes in our local network view",
+    "Returns a list of all nodes that we know about"};
+AUTODATA(json_command, &getnodes_command);
+
+static bool json_getroute_reply(struct subd *gossip, const u8 *reply, const int *fds,
+				struct command *cmd)
+{
+	struct json_result *response;
+	struct route_hop *hops;
+	size_t i;
+
+	fromwire_gossip_getroute_reply(reply, reply, NULL, &hops);
+
+	if (tal_count(hops) == 0) {
+		command_fail(cmd, "Could not find a route");
+		return true;
+	}
+
+	response = new_json_result(cmd);
+	json_object_start(response, NULL);
+	json_array_start(response, "route");
+	for (i=0; i<tal_count(hops); i++) {
+		json_object_start(response, NULL);
+		json_add_pubkey(response, "id", &hops[i].nodeid);
+		json_add_u64(response, "msatoshi", hops[i].amount);
+		json_add_num(response, "delay", hops[i].delay);
+		json_object_end(response);
+	}
+	json_array_end(response);
+	json_object_end(response);
+	command_success(cmd, response);
+	return true;
+}
+
+static void json_getroute(struct command *cmd, const char *buffer, const jsmntok_t *params)
+{
+	struct pubkey id;
+	jsmntok_t *idtok, *msatoshitok, *riskfactortok;
+	u64 msatoshi;
+	double riskfactor;
+	struct lightningd *ld = ld_from_dstate(cmd->dstate);
+	if (!json_get_params(buffer, params,
+			     "id", &idtok,
+			     "msatoshi", &msatoshitok,
+			     "riskfactor", &riskfactortok,
+			     NULL)) {
+		command_fail(cmd, "Need id, msatoshi and riskfactor");
+		return;
+	}
+
+	if (!pubkey_from_hexstr(buffer + idtok->start,
+				idtok->end - idtok->start, &id)) {
+		command_fail(cmd, "Invalid id");
+		return;
+	}
+
+	if (!json_tok_u64(buffer, msatoshitok, &msatoshi)) {
+		command_fail(cmd, "'%.*s' is not a valid number",
+			     (int)(msatoshitok->end - msatoshitok->start),
+			     buffer + msatoshitok->start);
+		return;
+	}
+
+	if (!json_tok_double(buffer, riskfactortok, &riskfactor)) {
+		command_fail(cmd, "'%.*s' is not a valid double",
+			     (int)(riskfactortok->end - riskfactortok->start),
+			     buffer + riskfactortok->start);
+		return;
+	}
+	u8 *req = towire_gossip_getroute_request(cmd, &cmd->dstate->id, &id, msatoshi, riskfactor*1000);
+	subd_req(ld->gossip, ld->gossip, req, -1, 0, json_getroute_reply, cmd);
+}
+
+static const struct json_command getroute_command = {
+	"getroute", json_getroute,
+	"Return route to {id} for {msatoshi}, using {riskfactor}",
+	"Returns a {route} array of {id} {msatoshi} {delay}: msatoshi and delay (in blocks) is cumulative."
+};
+AUTODATA(json_command, &getroute_command);
+
+/* Called upon receiving a getchannels_reply from `gossipd` */
+static bool json_getchannels_reply(struct subd *gossip, const u8 *reply,
+				   const int *fds, struct command *cmd)
+{
+	size_t i;
+	struct gossip_getchannels_entry *entries;
+	struct json_result *response = new_json_result(cmd);
+	struct short_channel_id *scid;
+
+	if (!fromwire_gossip_getchannels_reply(reply, reply, NULL, &entries)) {
+		command_fail(cmd, "Invalid reply from gossipd");
+		return true;
+	}
+
+	json_object_start(response, NULL);
+	json_array_start(response, "channels");
+	for (i = 0; i < tal_count(entries); i++) {
+		scid = &entries[i].short_channel_id;
+		json_object_start(response, NULL);
+		json_add_pubkey(response, "source", &entries[i].source);
+		json_add_pubkey(response, "destination",
+				&entries[i].destination);
+		json_add_bool(response, "active", entries[i].active);
+		json_add_num(response, "fee_per_kw", entries[i].fee_per_kw);
+		json_add_num(response, "last_update",
+			     entries[i].last_update_timestamp);
+		json_add_num(response, "flags", entries[i].flags);
+		json_add_num(response, "delay", entries[i].delay);
+		json_add_string(response, "short_id",
+				tal_fmt(reply, "%d:%d:%d/%d", scid->blocknum,
+					scid->txnum, scid->outnum,
+					entries[i].flags & 0x1));
+		json_object_end(response);
+	}
+	json_array_end(response);
+	json_object_end(response);
+	command_success(cmd, response);
+	return true;
+}
+
+static void json_getchannels(struct command *cmd, const char *buffer,
+			     const jsmntok_t *params)
+{
+	struct lightningd *ld = ld_from_dstate(cmd->dstate);
+	u8 *req = towire_gossip_getchannels_request(cmd);
+	subd_req(ld->gossip, ld->gossip, req, -1, 0, json_getchannels_reply, cmd);
+}
+
+static const struct json_command getchannels_command = {
+    "getchannels", json_getchannels, "List all known channels.",
+    "Returns a 'channels' array with all known channels including their fees."};
+AUTODATA(json_command, &getchannels_command);

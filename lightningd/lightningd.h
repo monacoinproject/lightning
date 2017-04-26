@@ -4,6 +4,7 @@
 #include <bitcoin/privkey.h>
 #include <ccan/container_of/container_of.h>
 #include <daemon/lightningd.h>
+#include <lightningd/htlc_end.h>
 
 /* BOLT #1:
  *
@@ -51,11 +52,14 @@ struct lightningd {
 
 	/* UTXOs we have available to spend. */
 	struct list_head utxos;
+
+	/* HTLCs in flight. */
+	struct htlc_end_map htlc_ends;
 };
 
 void derive_peer_seed(struct lightningd *ld, struct privkey *peer_seed,
 		      const struct pubkey *peer_id);
-
+struct peer *find_peer_by_unique_id(struct lightningd *ld, u64 unique_id);
 /* FIXME */
 static inline struct lightningd *
 ld_from_dstate(const struct lightningd_state *dstate)

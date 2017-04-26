@@ -1,7 +1,9 @@
 #include "utils.h"
 #include "wire.h"
+#include <bitcoin/preimage.h>
 #include <bitcoin/pubkey.h>
 #include <bitcoin/shadouble.h>
+#include <ccan/build_assert/build_assert.h>
 #include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
@@ -150,6 +152,11 @@ void fromwire_sha256_double(const u8 **cursor, size_t *max,
 	fromwire_sha256(cursor, max, &sha256d->sha);
 }
 
+void fromwire_preimage(const u8 **cursor, size_t *max, struct preimage *preimage)
+{
+	fromwire(cursor, max, preimage, sizeof(*preimage));
+}
+
 void fromwire_ipv6(const u8 **cursor, size_t *max, struct ipv6 *ipv6)
 {
 	fromwire(cursor, max, ipv6, sizeof(*ipv6));
@@ -160,51 +167,9 @@ void fromwire_u8_array(const u8 **cursor, size_t *max, u8 *arr, size_t num)
 	fromwire(cursor, max, arr, num);
 }
 
-void fromwire_u32_array(const u8 **cursor, size_t *max, u32 *arr, size_t num)
-{
-	size_t i;
-
-	for (i = 0; i < num; i++)
-		arr[i] = fromwire_u32(cursor, max);
-}
-
-void fromwire_u64_array(const u8 **cursor, size_t *max, u64 *arr, size_t num)
-{
-	size_t i;
-
-	for (i = 0; i < num; i++)
-		arr[i] = fromwire_u64(cursor, max);
-}
-
-void fromwire_bool_array(const u8 **cursor, size_t *max, bool *arr, size_t num)
-{
-	size_t i;
-
-	for (i = 0; i < num; i++)
-		arr[i] = fromwire_bool(cursor, max);
-}
-
 void fromwire_pad(const u8 **cursor, size_t *max, size_t num)
 {
 	fromwire(cursor, max, NULL, num);
-}
-
-void fromwire_secp256k1_ecdsa_signature_array(const u8 **cursor, size_t *max,
-			      secp256k1_ecdsa_signature *arr, size_t num)
-{
-	size_t i;
-
-	for (i = 0; i < num; i++)
-		fromwire_secp256k1_ecdsa_signature(cursor, max, arr + i);
-}
-
-void fromwire_sha256_double_array(const u8 **cursor, size_t *max,
-				  struct sha256_double *arr, size_t num)
-{
-	size_t i;
-
-	for (i = 0; i < num; i++)
-		fromwire_sha256_double(cursor, max, arr + i);
 }
 
 static char *fmt_short_channel_id(const tal_t *ctx,
@@ -214,3 +179,20 @@ static char *fmt_short_channel_id(const tal_t *ctx,
 }
 REGISTER_TYPE_TO_STRING(short_channel_id, fmt_short_channel_id);
 REGISTER_TYPE_TO_HEXSTR(channel_id);
+
+/* BOLT #2:
+ *
+ * This message introduces the `channel-id` which identifies , which is
+ * derived from the funding transaction by combining the `funding-txid` and
+ * the `funding-output-index` using big-endian exclusive-OR
+ * (ie. `funding-output-index` alters the last two bytes).
+ */
+void derive_channel_id(struct channel_id *channel_id,
+		       struct sha256_double *txid, u16 txout)
+{
+	BUILD_ASSERT(sizeof(*channel_id) == sizeof(*txid));
+	memcpy(channel_id, txid, sizeof(*channel_id));
+	channel_id->id[sizeof(*channel_id)-2] ^= txout >> 8;
+	channel_id->id[sizeof(*channel_id)-1] ^= txout;
+}
+

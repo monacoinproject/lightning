@@ -7,8 +7,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <lightningd/lightningd.h>
+#include <lightningd/status.h>
 #include <lightningd/subd.h>
-#include <status.h>
 #include <stdarg.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -44,29 +44,61 @@ struct subd_req {
 
 	/* Callback for a reply. */
 	int reply_type;
-	bool (*replycb)(struct subd *, const u8 *msg_in, void *reply_data);
+	bool (*replycb)(struct subd *, const u8 *, const int *, void *);
 	void *replycb_data;
-	int *fd_in;
+
+	size_t num_reply_fds;
+	/* If non-NULL, this is here to disable replycb */
+	void *disabler;
 };
 
 static void free_subd_req(struct subd_req *sr)
 {
 	list_del(&sr->list);
+	/* Don't disable once we're freed! */
+	if (sr->disabler)
+		tal_free(sr->disabler);
 }
 
-static void add_req(struct subd *sd, int type,
-		    bool (*replycb)(struct subd *, const u8 *, void *),
-		    void *replycb_data,
-		    int *reply_fd_in)
+/* Called when the callback is disabled because caller was freed. */
+static bool ignore_reply(struct subd *sd, const u8 *msg, const int *fds,
+			 void *arg)
+{
+	size_t i;
+
+	log_debug(sd->log, "IGNORING REPLY");
+	for (i = 0; i < tal_count(fds); i++)
+		close(fds[i]);
+	return true;
+}
+
+static void disable_cb(void *disabler, struct subd_req *sr)
+{
+	sr->replycb = ignore_reply;
+	sr->disabler = NULL;
+}
+
+static void add_req(const tal_t *ctx,
+		    struct subd *sd, int type, size_t num_fds_in,
+		    bool (*replycb)(struct subd *, const u8 *, const int *,
+				    void *),
+		    void *replycb_data)
 {
 	struct subd_req *sr = tal(sd, struct subd_req);
 
 	sr->reply_type = type + SUBD_REPLY_OFFSET;
 	sr->replycb = replycb;
 	sr->replycb_data = replycb_data;
-	sr->fd_in = reply_fd_in;
-	if (sr->fd_in)
-		*sr->fd_in = -1;
+	sr->num_reply_fds = num_fds_in;
+
+	/* We don't allocate sr off ctx, because we still have to handle the
+	 * case where ctx is freed between request and reply.  Hence this
+	 * trick. */
+	if (ctx) {
+		sr->disabler = tal(ctx, char);
+		tal_add_destructor2(sr->disabler, disable_cb, sr);
+	} else
+		sr->disabler = NULL;
 	assert(strends(sd->msgname(sr->reply_type), "_REPLY"));
 
 	/* Keep in FIFO order: we sent in order, so replies will be too. */
@@ -130,7 +162,6 @@ static int subd(const char *dir, const char *name, bool debug,
 				goto child_errno_fail;
 			fdnum++;
 		}
-		close(STDOUT_FILENO);
 
 		/* Make (fairly!) sure all other fds are closed. */
 		max = sysconf(_SC_OPEN_MAX);
@@ -185,23 +216,43 @@ static struct io_plan *sd_msg_reply(struct io_conn *conn, struct subd *sd,
 	int type = fromwire_peektype(sd->msg_in);
 	bool keep_open;
 
-	if (sr->fd_in) {
-		/* Don't trust subd to set it blocking. */
-		set_blocking(*sr->fd_in, true);
-		log_info(sd->log, "REPLY %s with fd %i", sd->msgname(type),
-			 *sr->fd_in);
-	} else
-		log_info(sd->log, "REPLY %s", sd->msgname(type));
+	log_info(sd->log, "REPLY %s with %zu fds",
+		 sd->msgname(type), tal_count(sd->fds_in));
 
 	/* If not stolen, we'll free this below. */
 	tal_steal(sr, sd->msg_in);
-	keep_open = sr->replycb(sd, sd->msg_in, sr->replycb_data);
+	keep_open = sr->replycb(sd, sd->msg_in, sd->fds_in, sr->replycb_data);
 	tal_free(sr);
 
 	if (!keep_open)
 		return io_close(conn);
 
+	/* Free any fd array. */
+	sd->fds_in = tal_free(sd->fds_in);
 	return io_read_wire(conn, sd, &sd->msg_in, sd_msg_read, sd);
+}
+
+static struct io_plan *read_fds(struct io_conn *conn, struct subd *sd)
+{
+	if (sd->num_fds_in_read == tal_count(sd->fds_in)) {
+		size_t i;
+
+		/* Don't trust subd to set it blocking. */
+		for (i = 0; i < tal_count(sd->fds_in); i++)
+			set_blocking(sd->fds_in[i], true);
+		return sd_msg_read(conn, sd);
+	}
+	return io_recv_fd(conn, &sd->fds_in[sd->num_fds_in_read++],
+			  read_fds, sd);
+}
+
+static struct io_plan *sd_collect_fds(struct io_conn *conn, struct subd *sd,
+				      size_t num_fds)
+{
+	assert(!sd->fds_in);
+	sd->fds_in = tal_arr(sd, int, num_fds);
+	sd->num_fds_in_read = 0;
+	return read_fds(conn, sd);
 }
 
 static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
@@ -220,9 +271,10 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 	/* First, check for replies. */
 	sr = get_req(sd, type);
 	if (sr) {
-		/* If we need fd, read it and call us again. */
-		if (sr->fd_in && *sr->fd_in == -1)
-			return io_recv_fd(conn, sr->fd_in, sd_msg_read, sd);
+		if (sr->num_reply_fds && sd->fds_in == NULL)
+			return sd_collect_fds(conn, sd, sr->num_reply_fds);
+
+		assert(sr->num_reply_fds == tal_count(sd->fds_in));
 		return sd_msg_reply(conn, sd, sr);
 	}
 
@@ -241,30 +293,23 @@ static struct io_plan *sd_msg_read(struct io_conn *conn, struct subd *sd)
 			    sd->msgname(type), str_len, str);
 	else {
 		log_info(sd->log, "UPDATE %s", sd->msgname(type));
-		if (sd->msgcb) {
-			enum subd_msg_ret r;
 
-			/* If received from subd, set blocking. */
-			if (sd->fd_in != -1)
-				set_blocking(sd->fd_in, true);
-			r = sd->msgcb(sd, sd->msg_in, sd->fd_in);
-			switch (r) {
-			case SUBD_NEED_FD:
+		if (sd->msgcb) {
+			int i = sd->msgcb(sd, sd->msg_in, sd->fds_in);
+			if (i < 0)
+				return io_close(conn);
+			if (i != 0) {
+				/* Don't ask for fds twice! */
+				assert(!sd->fds_in);
 				/* Don't free msg_in: we go around again. */
 				tal_steal(sd, sd->msg_in);
 				tal_free(tmpctx);
-				return io_recv_fd(conn, &sd->fd_in,
-						  sd_msg_read, sd);
-			case SUBD_COMPLETE:
-				break;
-			default:
-				fatal("Unknown msgcb return for %s:%s: %u",
-				      sd->name, sd->msgname(type), r);
+				return sd_collect_fds(conn, sd, i);
 			}
 		}
 	}
 	sd->msg_in = NULL;
-	sd->fd_in = -1;
+	sd->fds_in = tal_free(sd->fds_in);
 	tal_free(tmpctx);
 	return io_read_wire(conn, sd, &sd->msg_in, sd_msg_read, sd);
 }
@@ -292,23 +337,16 @@ static void destroy_subd(struct subd *sd)
 static struct io_plan *msg_send_next(struct io_conn *conn, struct subd *sd)
 {
 	const u8 *msg = msg_dequeue(&sd->outq);
-
-	if (sd->fd_to_close != -1) {
-		close(sd->fd_to_close);
-		sd->fd_to_close = -1;
-	}
+	int fd;
 
 	/* Nothing to do?  Wait for msg_enqueue. */
 	if (!msg)
 		return msg_queue_wait(conn, &sd->outq, msg_send_next, sd);
 
-	/* We overload STATUS_TRACE for outgoing to mean "send an fd" */
-	if (fromwire_peektype(msg) == STATUS_TRACE) {
-		const u8 *p = msg + sizeof(be16);
-		size_t len = tal_count(msg) - sizeof(be16);
-		sd->fd_to_close = fromwire_u32(&p, &len);
+	fd = msg_extract_fd(msg);
+	if (fd >= 0) {
 		tal_free(msg);
-		return io_send_fd(conn, sd->fd_to_close, msg_send_next, sd);
+		return io_send_fd(conn, fd, true, msg_send_next, sd);
 	}
 	return io_write_wire(conn, take(msg), msg_send_next, sd);
 }
@@ -325,8 +363,8 @@ struct subd *new_subd(const tal_t *ctx,
 				const char *name,
 				struct peer *peer,
 				const char *(*msgname)(int msgtype),
-				enum subd_msg_ret (*msgcb)
-				(struct subd *, const u8 *, int fd),
+				int (*msgcb)(struct subd *, const u8 *,
+					     const int *fds),
 				void (*finished)(struct subd *, int),
 				...)
 {
@@ -351,9 +389,8 @@ struct subd *new_subd(const tal_t *ctx,
 	sd->finished = finished;
 	sd->msgname = msgname;
 	sd->msgcb = msgcb;
-	sd->fd_in = -1;
+	sd->fds_in = NULL;
 	msg_queue_init(&sd->outq, sd);
-	sd->fd_to_close = -1;
 	tal_add_destructor(sd, destroy_subd);
 	list_head_init(&sd->reqs);
 
@@ -369,33 +406,55 @@ struct subd *new_subd(const tal_t *ctx,
 
 void subd_send_msg(struct subd *sd, const u8 *msg_out)
 {
-	/* We overload STATUS_TRACE for outgoing to mean "send an fd" */
-	assert(fromwire_peektype(msg_out) != STATUS_TRACE);
-	if (!taken(msg_out))
-		msg_out = tal_dup_arr(sd, u8, msg_out, tal_len(msg_out), 0);
 	msg_enqueue(&sd->outq, msg_out);
 }
 
 void subd_send_fd(struct subd *sd, int fd)
 {
-	/* We overload STATUS_TRACE for outgoing to mean "send an fd" */
-	u8 *fdmsg = tal_arr(sd, u8, 0);
-	towire_u16(&fdmsg, STATUS_TRACE);
-	towire_u32(&fdmsg, fd);
-	msg_enqueue(&sd->outq, fdmsg);
+	msg_enqueue_fd(&sd->outq, fd);
 }
 
-void subd_req_(struct subd *sd,
+void subd_req_(const tal_t *ctx,
+	       struct subd *sd,
 	       const u8 *msg_out,
-	       int fd_out, int *fd_in,
-	       bool (*replycb)(struct subd *, const u8 *, void *),
+	       int fd_out, size_t num_fds_in,
+	       bool (*replycb)(struct subd *, const u8 *, const int *, void *),
 	       void *replycb_data)
 {
+	/* Grab type now in case msg_out is taken() */
+	int type = fromwire_peektype(msg_out);
+
 	subd_send_msg(sd, msg_out);
 	if (fd_out >= 0)
 		subd_send_fd(sd, fd_out);
 
-	add_req(sd, fromwire_peektype(msg_out), replycb, replycb_data, fd_in);
+	add_req(ctx, sd, type, num_fds_in, replycb, replycb_data);
+}
+
+void subd_shutdown(struct subd *sd, unsigned int seconds)
+{
+	/* Idempotent. */
+	if (!sd->conn)
+		return;
+
+	log_debug(sd->log, "Shutting down");
+
+	/* No finished callback any more. */
+	sd->finished = NULL;
+	/* Don't free sd when we close connection manually. */
+	tal_steal(sd->ld, sd);
+	/* Close connection: should begin shutdown now. */
+	sd->conn = tal_free(sd->conn);
+
+	/* Do we actually want to wait? */
+	while (seconds) {
+		if (waitpid(sd->pid, NULL, WNOHANG) > 0) {
+			tal_del_destructor(sd, destroy_subd);
+			return;
+		}
+		sleep(1);
+		seconds--;
+	}
 }
 
 char *opt_subd_debug(const char *optarg, struct lightningd *ld)

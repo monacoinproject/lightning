@@ -4,7 +4,8 @@
 wire-wrongdir:
 	$(MAKE) -C .. wire-all
 
-WIRE_HEADERS := wire/wire.h			\
+WIRE_HEADERS := wire/peer_wire.h		\
+		wire/wire.h			\
 		wire/wire_sync.h		\
 		wire/wire_io.h
 WIRE_GEN_HEADERS := wire/gen_peer_wire.h wire/gen_onion_wire.h
@@ -13,11 +14,12 @@ WIRE_GEN_ONION_SRC := wire/gen_onion_wire.c
 WIRE_SRC := wire/wire_sync.c			\
 		wire/wire_io.c			\
 		wire/fromwire.c			\
+		wire/peer_wire.c		\
 		wire/towire.c
 
 WIRE_OBJS := $(WIRE_SRC:.c=.o) $(WIRE_GEN_SRC:.c=.o)
 WIRE_ONION_OBJS := $(WIRE_GEN_ONION_SRC:.c=.o)
-$(WIRE_OBJS): $(CCAN_HEADERS)
+$(WIRE_OBJS): $(CCAN_HEADERS) $(WIRE_HEADERS) $(WIRE_GEN_HEADERS)
 
 # They may not have the bolts.
 BOLT_EXTRACT=$(BOLTDIR)/tools/extract-formats.py
@@ -40,8 +42,8 @@ wire/gen_onion_wire.h: $(WIRE_GEN) wire/gen_onion_wire_csv
 wire/gen_onion_wire.c: $(WIRE_GEN) wire/gen_onion_wire_csv
 	$(WIRE_GEN) ${@:.c=.h} onion_type < wire/gen_onion_wire_csv > $@
 
-wire/gen_peer_wire.o: wire/gen_peer_wire.h
-wire/gen_onion_wire.o: wire/gen_onion_wire.h
+wire/gen_peer_wire.o: wire/gen_peer_wire.h $(CCAN_HEADERS)
+wire/gen_onion_wire.o: wire/gen_onion_wire.h $(CCAN_HEADERS)
 
 check-source: $(WIRE_SRC:%=check-src-include-order/%) $(WIRE_HEADERS:%=check-hdr-include-order/%)
 

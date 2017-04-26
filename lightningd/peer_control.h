@@ -2,9 +2,13 @@
 #define LIGHTNING_LIGHTNINGD_PEER_CONTROL_H
 #include "config.h"
 #include <ccan/compiler/compiler.h>
+#include <ccan/list/list.h>
+#include <daemon/json.h>
 #include <daemon/netaddr.h>
 #include <lightningd/channel_config.h>
 #include <stdbool.h>
+
+#define ANNOUNCE_MIN_DEPTH 6
 
 struct crypto_state;
 
@@ -36,26 +40,36 @@ struct peer {
 	/* Where we connected to, or it connected from. */
 	struct netaddr netaddr;
 
-	/* HSM connection for this peer. */
-	int hsmfd;
-
 	/* Json command which made us connect (if any) */
 	struct command *connect_cmd;
 
 	/* Our channel config. */
 	struct channel_config our_config;
 
+	/* Minimum funding depth (specified by us if they fund). */
+	u32 minimum_depth;
+
 	/* Funding txid and amounts (once known) */
 	struct sha256_double *funding_txid;
 	u16 funding_outnum;
 	u64 funding_satoshi, push_msat;
 
+	/* Channel balance (LOCAL and REMOTE); if we have one. */
+	u64 *balance;
+
 	/* Secret seed (FIXME: Move to hsm!) */
 	struct privkey *seed;
+
+	/* Gossip client fd, forwarded to the respective owner */
+	int gossip_client_fd;
+	bool locked;
 };
 
 struct peer *peer_by_unique_id(struct lightningd *ld, u64 unique_id);
 struct peer *peer_by_id(struct lightningd *ld, const struct pubkey *id);
+struct peer *peer_from_json(struct lightningd *ld,
+			    const char *buffer,
+			    jsmntok_t *peeridtok);
 
 void peer_accept_open(struct peer *peer,
 		      const struct crypto_state *cs, const u8 *msg);

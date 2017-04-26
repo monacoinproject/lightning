@@ -112,7 +112,7 @@ struct msg_accept_channel {
 struct msg_update_fulfill_htlc {
 	struct channel_id channel_id;
 	u64 id;
-	struct sha256 payment_preimage;
+	struct preimage payment_preimage;
 };
 struct msg_shutdown {
 	struct channel_id channel_id;
@@ -126,8 +126,6 @@ struct msg_revoke_and_ack {
 	struct channel_id channel_id;
 	struct sha256 per_commitment_secret;
 	struct pubkey next_per_commitment_point;
-	u8 padding[1];
-	secp256k1_ecdsa_signature *htlc_timeout_signature;
 };
 struct msg_channel_update {
 	secp256k1_ecdsa_signature signature;
@@ -149,7 +147,7 @@ struct msg_announcement_signatures {
 	secp256k1_ecdsa_signature announcement_node_signature;
 	secp256k1_ecdsa_signature announcement_bitcoin_signature;
 };
-struct msg_commit_sig {
+struct msg_commitment_signed {
 	struct channel_id channel_id;
 	secp256k1_ecdsa_signature signature;
 	secp256k1_ecdsa_signature *htlc_signature;
@@ -164,6 +162,7 @@ struct msg_node_announcement {
 	u8 *addresses;
 };
 struct msg_open_channel {
+	struct sha256 chain_hash;
 	struct channel_id temporary_channel_id;
 	u64 funding_satoshis;
 	u64 push_msat;
@@ -252,6 +251,7 @@ static void *towire_struct_open_channel(const tal_t *ctx,
 						const struct msg_open_channel *s)
 {
 	return towire_open_channel(ctx, 
+				   &s->chain_hash,
 				   &s->temporary_channel_id,
 				   s->funding_satoshis,
 				   s->push_msat,
@@ -273,7 +273,8 @@ static struct msg_open_channel *fromwire_struct_open_channel(const tal_t *ctx, c
 {
 	struct msg_open_channel *s = tal(ctx, struct msg_open_channel);
 
-	if (fromwire_open_channel(p, plen, 
+	if (fromwire_open_channel(p, plen,
+				  &s->chain_hash,
 				  &s->temporary_channel_id,
 				  &s->funding_satoshis,
 				  &s->push_msat,
@@ -477,20 +478,20 @@ static struct msg_update_fulfill_htlc *fromwire_struct_update_fulfill_htlc(const
 	return tal_free(s);
 }
 
-static void *towire_struct_commit_sig(const tal_t *ctx,
-				      const struct msg_commit_sig *s)
+static void *towire_struct_commitment_signed(const tal_t *ctx,
+				      const struct msg_commitment_signed *s)
 {
-	return towire_commit_sig(ctx, 
-				 &s->channel_id,
-				 &s->signature,
-				 s->htlc_signature);
+	return towire_commitment_signed(ctx, 
+					&s->channel_id,
+					&s->signature,
+					s->htlc_signature);
 }
 
-static struct msg_commit_sig *fromwire_struct_commit_sig(const tal_t *ctx, const void *p, size_t *plen)
+static struct msg_commitment_signed *fromwire_struct_commitment_signed(const tal_t *ctx, const void *p, size_t *plen)
 {
-	struct msg_commit_sig *s = tal(ctx, struct msg_commit_sig);
+	struct msg_commitment_signed *s = tal(ctx, struct msg_commitment_signed);
 
-	if (!fromwire_commit_sig(s, p, plen, 
+	if (!fromwire_commitment_signed(s, p, plen, 
 				&s->channel_id,
 				&s->signature,
 				&s->htlc_signature))
@@ -501,24 +502,20 @@ static struct msg_commit_sig *fromwire_struct_commit_sig(const tal_t *ctx, const
 static void *towire_struct_revoke_and_ack(const tal_t *ctx,
 				      const struct msg_revoke_and_ack *s)
 {
-	towire_pad_arr = s->padding;
 	return towire_revoke_and_ack(ctx, 
 				     &s->channel_id,
 				     &s->per_commitment_secret,
-				     &s->next_per_commitment_point,
-				     s->htlc_timeout_signature);
+				     &s->next_per_commitment_point);
 }
 
 static struct msg_revoke_and_ack *fromwire_struct_revoke_and_ack(const tal_t *ctx, const void *p, size_t *plen)
 {
 	struct msg_revoke_and_ack *s = tal(ctx, struct msg_revoke_and_ack);
 
-	fromwire_pad_arr = s->padding;
-	if (!fromwire_revoke_and_ack(s, p, plen, 
-				    &s->channel_id,
-				    &s->per_commitment_secret,
-				    &s->next_per_commitment_point,
-				    &s->htlc_timeout_signature))
+	if (!fromwire_revoke_and_ack(p, plen, 
+				     &s->channel_id,
+				     &s->per_commitment_secret,
+				     &s->next_per_commitment_point))
 		return tal_free(s);
 	return s;
 	
@@ -718,8 +715,8 @@ static bool update_fail_htlc_eq(const struct msg_update_fail_htlc *a,
 		&& eq_var(a, b, reason);
 }
 
-static bool commit_sig_eq(const struct msg_commit_sig *a,
-			  const struct msg_commit_sig *b)
+static bool commitment_signed_eq(const struct msg_commitment_signed *a,
+			  const struct msg_commitment_signed *b)
 {
 	return eq_upto(a, b, htlc_signature)
 		&& eq_var(a, b, htlc_signature);
@@ -780,8 +777,7 @@ static bool funding_created_eq(const struct msg_funding_created *a,
 static bool revoke_and_ack_eq(const struct msg_revoke_and_ack *a,
 			      const struct msg_revoke_and_ack *b)
 {
-	return eq_with(a, b, padding)
-		&& eq_var(a, b, htlc_timeout_signature);
+	return structeq(a, b);
 }
 
 static bool open_channel_eq(const struct msg_open_channel *a,
@@ -839,7 +835,7 @@ int main(void)
 	struct msg_funding_locked fl, *fl2;
 	struct msg_announcement_signatures as, *as2;
 	struct msg_update_fail_htlc ufh, *ufh2;
-	struct msg_commit_sig cs, *cs2;
+	struct msg_commitment_signed cs, *cs2;
 	struct msg_funding_signed fs, *fs2;
 	struct msg_closing_signed cls, *cls2;
 	struct msg_update_fulfill_htlc uflh, *uflh2;
@@ -910,12 +906,12 @@ int main(void)
 	cs.htlc_signature = tal_arr(ctx, secp256k1_ecdsa_signature, 2);
 	memset(cs.htlc_signature, 2, sizeof(secp256k1_ecdsa_signature)*2);
 	
-	msg = towire_struct_commit_sig(ctx, &cs);
+	msg = towire_struct_commitment_signed(ctx, &cs);
 	len = tal_count(msg);
-	cs2 = fromwire_struct_commit_sig(ctx, msg, &len);
+	cs2 = fromwire_struct_commitment_signed(ctx, msg, &len);
 	assert(len == 0);
-	assert(commit_sig_eq(&cs, cs2));
-	test_corruption(&cs, cs2, commit_sig);
+	assert(commitment_signed_eq(&cs, cs2));
+	test_corruption(&cs, cs2, commitment_signed);
 
 	memset(&fs, 2, sizeof(fs));
 	
@@ -999,8 +995,6 @@ int main(void)
 
 	memset(&raa, 2, sizeof(raa));
 	set_pubkey(&raa.next_per_commitment_point);
-	raa.htlc_timeout_signature = tal_arr(ctx, secp256k1_ecdsa_signature, 2);
-	memset(raa.htlc_timeout_signature, 2, sizeof(secp256k1_ecdsa_signature) * 2);
 	
 	msg = towire_struct_revoke_and_ack(ctx, &raa);
 	len = tal_count(msg);
