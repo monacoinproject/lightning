@@ -35,7 +35,7 @@ static bool announce_channel(const tal_t *ctx, struct ircstate *state, struct pe
 		return false;
 
 	bitcoin_txid_to_hex(&p->anchor.txid, txid, sizeof(txid));
-	msg->channel = "#lightning-nodes";
+	msg->channel = "#mona-lightning-nodes";
 	msg->msg = tal_fmt(
 		msg, "CHAN %s %s %s %d %d %d %d %d",
 		pubkey_to_hexstr(msg, &state->dstate->id),
@@ -65,7 +65,7 @@ static void announce_node(const tal_t *ctx, struct ircstate *state)
 		return;
 	}
 
-	msg->channel = "#lightning-nodes";
+	msg->channel = "#mona-lightning-nodes";
 	msg->msg = tal_fmt(
 		msg, "NODE %s %s %d",
 		pubkey_to_hexstr(msg, &state->dstate->id),
@@ -253,7 +253,7 @@ static void handle_irc_command(struct ircstate *istate, const struct irccommand 
 
 static void handle_irc_connected(struct ircstate *istate)
 {
-	irc_send(istate, "JOIN", "#lightning-nodes");
+	irc_send(istate, "JOIN", "#mona-lightning-nodes");
 	irc_send(istate, "WHOIS", "%s", istate->nick);
 }
 
